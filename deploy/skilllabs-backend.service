@@ -1,0 +1,31 @@
+# systemd unit for the Lead Management CRM backend (Express API).
+#
+# Install:
+#   sudo cp deploy/skilllabs-backend.service /etc/systemd/system/skilllabs-backend.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now skilllabs-backend
+#
+# Logs:
+#   journalctl -u skilllabs-backend -f
+#
+# Adjust WorkingDirectory/User/EnvironmentFile to match your server layout.
+
+[Unit]
+Description=Skill Labs Lead Management CRM - Backend API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=skilllabs
+WorkingDirectory=/opt/skilllabs-crm/backend
+EnvironmentFile=/opt/skilllabs-crm/backend/.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

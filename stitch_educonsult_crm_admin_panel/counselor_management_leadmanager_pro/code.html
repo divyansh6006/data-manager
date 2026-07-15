@@ -1,0 +1,571 @@
+<!DOCTYPE html><html class="light" lang="en"><head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1.0" name="viewport">
+<title>Counselor &amp; Team Management | LeadManager Pro</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&amp;family=Geist:wght@400&amp;family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&amp;display=swap" rel="stylesheet">
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "tertiary": "#482700",
+                    "background": "#f9f9ff",
+                    "primary-fixed-dim": "#9acee1",
+                    "surface-dim": "#cfdaf2",
+                    "primary-container": "#0f4c5c",
+                    "secondary": "#505f76",
+                    "on-surface-variant": "#40484b",
+                    "surface-container": "#e7eeff",
+                    "tertiary-container": "#623d13",
+                    "on-tertiary-fixed-variant": "#643e14",
+                    "on-tertiary": "#ffffff",
+                    "error-container": "#ffdad6",
+                    "on-tertiary-container": "#dda975",
+                    "on-error": "#ffffff",
+                    "outline": "#70787c",
+                    "surface-tint": "#306576",
+                    "primary": "#003441",
+                    "surface-container-lowest": "#ffffff",
+                    "error": "#ba1a1a",
+                    "on-secondary": "#ffffff",
+                    "on-primary": "#ffffff",
+                    "tertiary-fixed-dim": "#f3bc87",
+                    "on-secondary-fixed": "#0b1c30",
+                    "on-secondary-container": "#54647a",
+                    "surface-variant": "#d8e3fb",
+                    "surface-container-highest": "#d8e3fb",
+                    "secondary-fixed-dim": "#b7c8e1",
+                    "on-background": "#111c2d",
+                    "surface-bright": "#f9f9ff",
+                    "on-primary-container": "#87bbce",
+                    "outline-variant": "#c0c8cb",
+                    "surface-container-low": "#f0f3ff",
+                    "on-primary-fixed-variant": "#114d5d",
+                    "on-tertiary-fixed": "#2c1600",
+                    "inverse-primary": "#9acee1",
+                    "surface-container-high": "#dee8ff",
+                    "inverse-on-surface": "#ecf1ff",
+                    "primary-fixed": "#b6ebfe",
+                    "secondary-container": "#d0e1fb",
+                    "on-surface": "#111c2d",
+                    "inverse-surface": "#263143",
+                    "secondary-fixed": "#d3e4fe",
+                    "on-error-container": "#93000a",
+                    "surface": "#f9f9ff",
+                    "tertiary-fixed": "#ffdcbe"
+            },
+            "borderRadius": {
+                    "DEFAULT": "0.125rem",
+                    "lg": "0.25rem",
+                    "xl": "0.5rem",
+                    "full": "0.75rem"
+            },
+            "spacing": {
+                    "table-cell-padding-x": "0.75rem",
+                    "gutter": "1rem",
+                    "table-cell-padding-y": "0.5rem",
+                    "sidebar-width": "240px",
+                    "topbar-height": "56px",
+                    "container-padding": "1.5rem"
+            },
+            "fontFamily": {
+                    "body-sm": ["Inter"],
+                    "headline-md": ["Inter"],
+                    "body-md": ["Inter"],
+                    "data-mono": ["Geist"],
+                    "label-caps": ["Inter"],
+                    "headline-lg": ["Inter"]
+            },
+            "fontSize": {
+                    "body-sm": ["13px", {"lineHeight": "18px", "fontWeight": "400"}],
+                    "headline-md": ["18px", {"lineHeight": "24px", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                    "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                    "data-mono": ["13px", {"lineHeight": "18px", "fontWeight": "400"}],
+                    "label-caps": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700"}],
+                    "headline-lg": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.02em", "fontWeight": "600"}]
+            }
+          },
+        },
+      }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+            vertical-align: middle;
+        }
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 10px;
+        }
+        .drawer-transition {
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+    </style>
+</head>
+<body class="bg-background text-on-background font-body-md selection:bg-primary-fixed-dim selection:text-primary">
+<!-- SideNavBar Anchor -->
+<aside class="fixed left-0 top-0 h-full w-[240px] bg-primary flex flex-col z-50">
+<div class="px-6 py-8">
+<h1 class="text-headline-md font-headline-md font-bold text-primary-fixed">LeadManager Pro</h1>
+<p class="text-label-caps font-label-caps text-on-primary-fixed-variant opacity-70 mt-1">Super Admin</p>
+</div>
+<nav class="flex-1 overflow-y-auto space-y-1">
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">dashboard</span>
+<span class="text-label-caps font-label-caps">Dashboard</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">upload_file</span>
+<span class="text-label-caps font-label-caps">Lead Upload</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">filter_list</span>
+<span class="text-label-caps font-label-caps">Filtering</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">account_tree</span>
+<span class="text-label-caps font-label-caps">Distribution</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 bg-primary-container text-on-primary-container border-l-4 border-primary-fixed" href="#">
+<span class="material-symbols-outlined">group</span>
+<span class="text-label-caps font-label-caps">Counselor Management</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">move_to_inbox</span>
+<span class="text-label-caps font-label-caps">Transfer Queue</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">assessment</span>
+<span class="text-label-caps font-label-caps">Reports</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">database</span>
+<span class="text-label-caps font-label-caps">Master Data</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">history</span>
+<span class="text-label-caps font-label-caps">Audit Log</span>
+</a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-primary-fixed-variant hover:bg-on-primary-fixed-variant/10 transition-colors duration-150" href="#">
+<span class="material-symbols-outlined">settings</span>
+<span class="text-label-caps font-label-caps">Settings</span>
+</a>
+</nav>
+<div class="p-4 border-t border-on-primary-fixed-variant/10">
+<div class="flex items-center gap-3">
+<div class="w-8 h-8 rounded bg-primary-fixed-dim flex items-center justify-center text-primary font-bold text-body-sm">SA</div>
+<div>
+<p class="text-body-sm font-bold text-primary-fixed leading-tight">Admin User</p>
+<p class="text-label-caps text-on-primary-fixed-variant text-[10px]">LOGOUT</p>
+</div>
+</div>
+</div>
+</aside>
+<!-- Main Content Area -->
+<main class="ml-[240px] min-h-screen flex flex-col relative overflow-x-hidden">
+<!-- TopNavBar Anchor -->
+<header class="h-[56px] bg-surface-container-lowest border-b border-outline-variant flex items-center justify-between px-6 sticky top-0 z-40">
+<div class="flex items-center flex-1 max-w-xl">
+<div class="relative w-full focus-within:ring-1 focus-within:ring-primary rounded-lg group">
+<span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-on-surface-variant text-body-md">search</span>
+<input class="w-full bg-surface-container-low border-none rounded-lg pl-10 pr-4 py-1.5 text-body-md focus:ring-0 placeholder:text-on-surface-variant/50" placeholder="Search counselors, teams, or roles... (Cmd+K)" type="text">
+</div>
+</div>
+<div class="flex items-center gap-4">
+<button class="p-2 hover:bg-surface-container-low rounded-full text-on-surface-variant relative transition-colors">
+<span class="material-symbols-outlined">notifications</span>
+<span class="absolute top-2 right-2 w-2 h-2 bg-error rounded-full"></span>
+</button>
+<button class="p-2 hover:bg-surface-container-low rounded-full text-on-surface-variant transition-colors">
+<span class="material-symbols-outlined">help_outline</span>
+</button>
+<div class="h-8 w-px bg-outline-variant mx-1"></div>
+<span class="text-label-caps font-label-caps text-on-surface-variant">Super Admin</span>
+<img class="w-8 h-8 rounded-full border border-outline-variant object-cover" data-alt="Professional headshot of a corporate administrative user, high-quality photography, neutral office background, clean professional look, warm studio lighting." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCXJ8KcI5gSYTJ1f3DdCZDIdy79g5eyTOW9cnluEB0AjbPzxOZ2rhF90s7mpppFgUT_PQOiq0MHMVPalE0CSap7BrQpB7yF63ftMlmfOfEaJyzo0KrFx2NFrKk7wZuO1FdIuOIq_BqD9hQXVO0QD_uouByKpluPdGs6BbSxEa3pNToxwTzdo-aFRbjup1FrIl_tdR8tTVTzl1_iSGCGcTMywxK1Tkyt8dcd6_KX6nxXGP077x3SrZuZgQ">
+</div>
+</header>
+<!-- Page Header & Filters -->
+<div class="p-6">
+<div class="flex justify-between items-end mb-6">
+<div>
+<h2 class="text-headline-lg font-headline-lg text-primary">Counselor &amp; Team Management</h2>
+<p class="text-body-md text-on-surface-variant mt-1">Manage sales representatives, team allocations, and real-time workload balance.</p>
+</div>
+<div class="flex gap-2">
+<button class="px-4 py-2 bg-surface-container-lowest border border-outline-variant text-on-surface font-semibold text-body-md rounded shadow-sm hover:bg-surface-container-low transition-all flex items-center gap-2">
+<span class="material-symbols-outlined text-[18px]">download</span> Export Report
+                    </button>
+<button class="px-4 py-2 bg-primary text-on-primary font-semibold text-body-md rounded shadow-sm hover:opacity-90 transition-all flex items-center gap-2">
+<span class="material-symbols-outlined text-[18px]">person_add</span> Add Counselor
+                    </button>
+</div>
+</div>
+<!-- Dashboard Stats Bar -->
+<div class="grid grid-cols-4 gap-4 mb-6">
+<div class="bg-surface-container-lowest border border-outline-variant p-4 rounded">
+<p class="text-label-caps font-label-caps text-on-surface-variant mb-1">Total Counselors</p>
+<div class="flex items-end justify-between">
+<span class="text-headline-lg font-headline-lg text-primary">124</span>
+<span class="text-body-sm text-green-600 flex items-center font-bold">
+<span class="material-symbols-outlined text-sm">trending_up</span> 4%
+                        </span>
+</div>
+</div>
+<div class="bg-surface-container-lowest border border-outline-variant p-4 rounded">
+<p class="text-label-caps font-label-caps text-on-surface-variant mb-1">Active Status</p>
+<div class="flex items-end justify-between">
+<span class="text-headline-lg font-headline-lg text-primary">112</span>
+<span class="px-2 py-0.5 bg-green-100 text-green-800 text-[10px] font-bold rounded">OPTIMAL</span>
+</div>
+</div>
+<div class="bg-surface-container-lowest border border-outline-variant p-4 rounded">
+<p class="text-label-caps font-label-caps text-on-surface-variant mb-1">Avg. Lead Load</p>
+<div class="flex items-end justify-between">
+<span class="text-headline-lg font-headline-lg text-primary">42 <span class="text-body-md font-normal text-on-surface-variant">/ day</span></span>
+<span class="text-data-mono font-data-mono text-on-surface-variant">Max: 60</span>
+</div>
+</div>
+<div class="bg-surface-container-lowest border border-outline-variant p-4 rounded">
+<p class="text-label-caps font-label-caps text-on-surface-variant mb-1">Conversion Rate</p>
+<div class="flex items-end justify-between">
+<span class="text-headline-lg font-headline-lg text-primary">18.4%</span>
+<span class="text-body-sm text-on-surface-variant">Target: 20%</span>
+</div>
+</div>
+</div>
+<!-- Persistent Filter Bar -->
+<div class="bg-surface-container-low p-3 mb-1 border border-outline-variant rounded-t flex items-center gap-4">
+<div class="flex items-center gap-2">
+<label class="text-label-caps font-label-caps text-on-surface-variant">TEAM:</label>
+<select class="bg-surface-container-lowest border-outline-variant text-body-sm rounded px-3 py-1.5 focus:ring-primary">
+<option>All Teams</option>
+<option>Alpha Squad</option>
+<option>B-Side Closers</option>
+<option>Retention Specialists</option>
+</select>
+</div>
+<div class="flex items-center gap-2">
+<label class="text-label-caps font-label-caps text-on-surface-variant">STATUS:</label>
+<select class="bg-surface-container-lowest border-outline-variant text-body-sm rounded px-3 py-1.5 focus:ring-primary">
+<option>All Status</option>
+<option>Active</option>
+<option>On Leave</option>
+<option>Suspended</option>
+</select>
+</div>
+<div class="flex items-center gap-2">
+<label class="text-label-caps font-label-caps text-on-surface-variant">LOAD:</label>
+<select class="bg-surface-container-lowest border-outline-variant text-body-sm rounded px-3 py-1.5 focus:ring-primary">
+<option>Any Load</option>
+<option>Low (&lt; 30)</option>
+<option>Medium (30-50)</option>
+<option>High (&gt; 50)</option>
+</select>
+</div>
+<div class="flex-1"></div>
+<button class="text-body-sm text-primary font-bold hover:underline">Clear All</button>
+</div>
+<!-- Counselor Table -->
+<div class="bg-surface-container-lowest border-x border-b border-outline-variant rounded-b overflow-hidden">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-surface-container-low border-b border-outline-variant">
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant">Counselor Name</th>
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant">Role</th>
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant">Team</th>
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant">Status</th>
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant">Lead Load</th>
+<th class="px-6 py-3 text-label-caps font-label-caps text-on-surface-variant text-right">Actions</th>
+</tr>
+</thead>
+<tbody class="divide-y divide-outline-variant">
+<!-- Table Row 1 -->
+<tr class="hover:bg-surface-container-low/50 transition-colors group">
+<td class="px-6 py-3">
+<div class="flex items-center gap-3">
+<img class="w-8 h-8 rounded-full border border-outline-variant object-cover" data-alt="Portrait of a friendly male professional, corporate style, high quality commercial lighting, soft blurred office background, neutral colors." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCOZ4PnAB6o8-0FW87Tb0E7fTLgVwkj1leio-6YqKJyDYoGhhFUhnuTHU-KYF25e5grjJlqSka7kN8_J_AexZrDIEiVlvzMkJYJbfYc5jJG_S_0aF4N1QFWAaZu9sAQSyxuxhtTHWaeUMpy_Q24omePEmUMMpWIr22xrAquMAKB9-t-0woyzEqDrYX3hUYT4uXwuBhrBkPjiwrghXGJ6e1Ar8W3QjjN6zV3IeUXXOtq196-TuVTvrJwUg">
+<div>
+<p class="text-body-md font-bold text-on-surface">James Wilson</p>
+<p class="text-[11px] text-on-surface-variant font-data-mono uppercase tracking-wider">ID: #C-9021</p>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">Senior Consultant</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">Alpha Squad</td>
+<td class="px-6 py-3">
+<span class="px-2 py-0.5 bg-green-100 text-green-800 text-[11px] font-bold rounded">ACTIVE</span>
+</td>
+<td class="px-6 py-3">
+<div class="w-32">
+<div class="flex justify-between text-[11px] font-data-mono mb-1">
+<span>48 / 60</span>
+<span class="text-on-surface-variant">80%</span>
+</div>
+<div class="h-1.5 bg-surface-container rounded-full overflow-hidden">
+<div class="h-full bg-primary w-[80%] rounded-full"></div>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-right">
+<div class="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+<button class="p-1.5 hover:bg-primary-container/10 text-primary rounded transition-colors" onclick="toggleDrawer(true)" title="View Profile">
+<span class="material-symbols-outlined">visibility</span>
+</button>
+<button class="p-1.5 hover:bg-error-container/10 text-error rounded transition-colors" title="Deactivate">
+<span class="material-symbols-outlined">person_off</span>
+</button>
+<button class="p-1.5 hover:bg-secondary-container/20 text-secondary rounded transition-colors" title="Reassign">
+<span class="material-symbols-outlined">move_up</span>
+</button>
+</div>
+</td>
+</tr>
+<!-- Table Row 2 -->
+<tr class="hover:bg-surface-container-low/50 transition-colors group">
+<td class="px-6 py-3">
+<div class="flex items-center gap-3">
+<img class="w-8 h-8 rounded-full border border-outline-variant object-cover" data-alt="Professional woman portrait, tech industry style, office environment with modern lighting, sharp focus, clean background, high resolution." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCZn2gZc9J7nEfwypl8JDxrjgYP15suF-EmRrwmJgARbqsmzM7cBRAnwERCGe7CuiDaHLiHdVYqjh2ALSpg9y8h__sDjrCYfBUdUvwS9Zz47ESnv4T_BgjxxTni1k4f-3asUgwFyoUNkm03nh-OuHdbP2lP-AKIggwxLdFRNv2Av6N-sjfkvdvSz9_6wfP4QsiBTGsKDMIXKvrrpZw33arU9YBTq585vpV_cm__mv1RVlDaR09Dbwt_mw">
+<div>
+<p class="text-body-md font-bold text-on-surface">Sarah Jenkins</p>
+<p class="text-[11px] text-on-surface-variant font-data-mono uppercase tracking-wider">ID: #C-8842</p>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">Lead Specialist</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">B-Side Closers</td>
+<td class="px-6 py-3">
+<span class="px-2 py-0.5 bg-orange-100 text-orange-800 text-[11px] font-bold rounded">ON LEAVE</span>
+</td>
+<td class="px-6 py-3">
+<div class="w-32">
+<div class="flex justify-between text-[11px] font-data-mono mb-1">
+<span>0 / 60</span>
+<span class="text-on-surface-variant">0%</span>
+</div>
+<div class="h-1.5 bg-surface-container rounded-full overflow-hidden">
+<div class="h-full bg-primary w-0 rounded-full"></div>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-right">
+<div class="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+<button class="p-1.5 hover:bg-primary-container/10 text-primary rounded transition-colors">
+<span class="material-symbols-outlined">visibility</span>
+</button>
+<button class="p-1.5 hover:bg-error-container/10 text-error rounded transition-colors">
+<span class="material-symbols-outlined">person_off</span>
+</button>
+<button class="p-1.5 hover:bg-secondary-container/20 text-secondary rounded transition-colors">
+<span class="material-symbols-outlined">move_up</span>
+</button>
+</div>
+</td>
+</tr>
+<!-- Table Row 3 -->
+<tr class="hover:bg-surface-container-low/50 transition-colors group">
+<td class="px-6 py-3">
+<div class="flex items-center gap-3">
+<img class="w-8 h-8 rounded-full border border-outline-variant object-cover" data-alt="Executive male portrait, professional business setting, high contrast lighting, clean professional attire, sharp and detailed, premium aesthetic." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDy8YgIR3NSo1HZadEWn20aghjnr4EXDFrHDuYOUVNb4J1_5iVSTQY5NPQF_kofZQzkIVbWuN16g8UBt4Nvf-P2J_eGd5nbqGdYwJnDLF783SX1FzITQMsf2YqOIDorjydxV2PYAU1nShVTTxQar7HGe4Sw4rqtknStRMep6TW8pH7U1lRCwysWO88QLhZOHFOntqx2X90qj0bxTrNHPU3rxUTOajsdp-XHV6fn-cmT8xuHeLtXPWeNFg">
+<div>
+<p class="text-body-md font-bold text-on-surface">Michael Chang</p>
+<p class="text-[11px] text-on-surface-variant font-data-mono uppercase tracking-wider">ID: #C-9104</p>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">Consultant</td>
+<td class="px-6 py-3 text-body-md text-on-surface-variant">Alpha Squad</td>
+<td class="px-6 py-3">
+<span class="px-2 py-0.5 bg-green-100 text-green-800 text-[11px] font-bold rounded">ACTIVE</span>
+</td>
+<td class="px-6 py-3">
+<div class="w-32">
+<div class="flex justify-between text-[11px] font-data-mono mb-1">
+<span>59 / 60</span>
+<span class="text-error font-bold">98%</span>
+</div>
+<div class="h-1.5 bg-surface-container rounded-full overflow-hidden">
+<div class="h-full bg-error w-[98%] rounded-full"></div>
+</div>
+</div>
+</td>
+<td class="px-6 py-3 text-right">
+<div class="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+<button class="p-1.5 hover:bg-primary-container/10 text-primary rounded transition-colors">
+<span class="material-symbols-outlined">visibility</span>
+</button>
+<button class="p-1.5 hover:bg-error-container/10 text-error rounded transition-colors">
+<span class="material-symbols-outlined">person_off</span>
+</button>
+<button class="p-1.5 hover:bg-secondary-container/20 text-secondary rounded transition-colors">
+<span class="material-symbols-outlined">move_up</span>
+</button>
+</div>
+</td>
+</tr>
+</tbody>
+</table>
+<div class="bg-surface-container-low px-6 py-3 flex items-center justify-between border-t border-outline-variant">
+<p class="text-body-sm text-on-surface-variant">Showing 1-10 of 124 counselors</p>
+<div class="flex items-center gap-2">
+<button class="p-1 hover:bg-surface-container rounded transition-colors"><span class="material-symbols-outlined">chevron_left</span></button>
+<span class="text-body-sm font-bold text-primary px-3">1</span>
+<button class="p-1 hover:bg-surface-container rounded transition-colors"><span class="material-symbols-outlined">chevron_right</span></button>
+</div>
+</div>
+</div>
+</div>
+</main>
+<!-- Side Panel (Drawer) - Counselor Detail -->
+<div class="fixed inset-0 bg-black/40 z-[60] hidden opacity-0 transition-opacity duration-300 pointer-events-none" id="drawerOverlay" onclick="toggleDrawer(false)"></div>
+<aside class="fixed top-0 right-0 h-full w-[480px] bg-white z-[70] shadow-2xl translate-x-full drawer-transition flex flex-col border-l border-outline-variant" id="counselorDrawer">
+<!-- Drawer Header -->
+<div class="p-6 bg-primary text-on-primary">
+<div class="flex justify-between items-start mb-4">
+<button class="p-2 -ml-2 hover:bg-on-primary/10 rounded-full transition-colors" onclick="toggleDrawer(false)">
+<span class="material-symbols-outlined">close</span>
+</button>
+<div class="flex gap-2">
+<button class="px-3 py-1.5 bg-on-primary text-primary font-bold text-[11px] rounded flex items-center gap-1 uppercase">
+<span class="material-symbols-outlined text-sm">edit</span> Edit Profile
+                    </button>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<img class="w-16 h-16 rounded border-2 border-primary-fixed-dim object-cover" data-alt="Portrait of a friendly male professional, corporate style, high quality commercial lighting, soft blurred office background, neutral colors." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDSczaXxXPQ4tcPPJgLlPCjjKUmqe5xDpuSWR0d9SVNtLgol_fB5qsn2Qb1dmnISnmUvS4am2XkBM_fwjHKgyvYChTftemc979urMza36U_SEdJO8uiw9TrIyg993X1a8gDq5GIMXn3pvGRBc-xVHgS5UWdqayC8PieqK1X5LV4HxxyQojj2u-gQ_lBXMHTqEz_uTmd_Z7ATeJKRvUh4K0gNBDL7YN2XxP3WNvh7MO8BaZEtnOUBcOSdQ">
+<div>
+<h3 class="text-headline-lg font-headline-lg leading-none mb-1">James Wilson</h3>
+<p class="text-body-md text-primary-fixed">Senior Consultant • Alpha Squad</p>
+<div class="flex items-center gap-2 mt-2">
+<span class="px-2 py-0.5 bg-green-500/20 text-primary-fixed text-[10px] font-bold rounded border border-primary-fixed/30 uppercase tracking-wider">ACTIVE</span>
+<span class="text-label-caps opacity-60">Joined Oct 2022</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Drawer Content -->
+<div class="flex-1 overflow-y-auto p-6 space-y-8">
+<!-- Pipeline Breakdown -->
+<section>
+<h4 class="text-label-caps font-label-caps text-on-surface-variant border-b border-outline-variant pb-2 mb-4">PIPELINE BREAKDOWN</h4>
+<div class="grid grid-cols-3 gap-3">
+<div class="bg-surface-container-low p-3 rounded">
+<p class="text-[10px] font-bold text-on-surface-variant uppercase mb-1">L1 Leads</p>
+<p class="text-headline-md font-headline-md text-primary">12</p>
+<p class="text-[10px] text-green-600 font-bold">New/Fresh</p>
+</div>
+<div class="bg-surface-container-low p-3 rounded">
+<p class="text-[10px] font-bold text-on-surface-variant uppercase mb-1">L2 Leads</p>
+<p class="text-headline-md font-headline-md text-primary">24</p>
+<p class="text-[10px] text-orange-600 font-bold">In-Progress</p>
+</div>
+<div class="bg-surface-container-low p-3 rounded">
+<p class="text-[10px] font-bold text-on-surface-variant uppercase mb-1">L3 Leads</p>
+<p class="text-headline-md font-headline-md text-primary">8</p>
+<p class="text-[10px] text-primary-container font-bold">Closing</p>
+</div>
+</div>
+</section>
+<!-- Lead Load Indicator -->
+<section>
+<div class="flex justify-between items-center mb-2">
+<h4 class="text-label-caps font-label-caps text-on-surface-variant">CURRENT LEAD LOAD</h4>
+<span class="text-data-mono font-bold text-primary">48 / 60</span>
+</div>
+<div class="h-3 bg-surface-container rounded-full overflow-hidden">
+<div class="h-full bg-primary w-[80%] rounded-full relative">
+<div class="absolute top-0 right-0 h-full w-4 bg-white/20 animate-pulse"></div>
+</div>
+</div>
+<p class="text-[11px] text-on-surface-variant mt-2 leading-relaxed italic">Approaching capacity threshold. Recommended to pause auto-distribution until backlog reduces.</p>
+</section>
+<!-- Recent Activity Log -->
+<section>
+<h4 class="text-label-caps font-label-caps text-on-surface-variant border-b border-outline-variant pb-2 mb-4">RECENT ACTIVITY LOG</h4>
+<div class="space-y-4">
+<!-- Activity Item 1 -->
+<div class="flex gap-3 relative">
+<div class="absolute left-[15px] top-8 bottom-[-16px] w-[1px] bg-outline-variant"></div>
+<div class="w-8 h-8 rounded-full bg-blue-50 border border-blue-200 flex items-center justify-center shrink-0 z-10">
+<span class="material-symbols-outlined text-blue-600 text-[18px]">call</span>
+</div>
+<div>
+<p class="text-body-sm font-bold text-on-surface">Call Completed - #LD-4410</p>
+<p class="text-[11px] text-on-surface-variant">Successful outreach. Appointment scheduled for Friday.</p>
+<p class="text-data-mono text-[10px] text-outline mt-1 uppercase">Today, 11:45 AM</p>
+</div>
+</div>
+<!-- Activity Item 2 -->
+<div class="flex gap-3 relative">
+<div class="absolute left-[15px] top-8 bottom-[-16px] w-[1px] bg-outline-variant"></div>
+<div class="w-8 h-8 rounded-full bg-green-50 border border-green-200 flex items-center justify-center shrink-0 z-10">
+<span class="material-symbols-outlined text-green-600 text-[18px]">done_all</span>
+</div>
+<div>
+<p class="text-body-sm font-bold text-on-surface">Lead Converted - #LD-4390</p>
+<p class="text-[11px] text-on-surface-variant">Closed as Premium Plan. Payment verified.</p>
+<p class="text-data-mono text-[10px] text-outline mt-1 uppercase">Today, 09:20 AM</p>
+</div>
+</div>
+<!-- Activity Item 3 -->
+<div class="flex gap-3">
+<div class="w-8 h-8 rounded-full bg-orange-50 border border-orange-200 flex items-center justify-center shrink-0 z-10">
+<span class="material-symbols-outlined text-orange-600 text-[18px]">mail</span>
+</div>
+<div>
+<p class="text-body-sm font-bold text-on-surface">Follow-up Email Sent</p>
+<p class="text-[11px] text-on-surface-variant">Bulk distribution to 15 cool-down leads.</p>
+<p class="text-data-mono text-[10px] text-outline mt-1 uppercase">Yesterday, 05:30 PM</p>
+</div>
+</div>
+</div>
+<button class="w-full mt-6 py-2 text-body-sm font-bold text-primary border border-primary/20 rounded hover:bg-primary-container/5 transition-colors">View Full Activity History</button>
+</section>
+</div>
+<!-- Drawer Footer -->
+<div class="p-4 border-t border-outline-variant bg-surface-container-lowest flex gap-2">
+<button class="flex-1 py-2 border border-outline-variant text-on-surface-variant font-bold text-body-sm rounded hover:bg-surface-container-low transition-colors" onclick="toggleDrawer(false)">Close</button>
+<button class="flex-1 py-2 bg-error text-on-error font-bold text-body-sm rounded hover:opacity-90 transition-all">Deactivate User</button>
+</div>
+</aside>
+<script>
+        function toggleDrawer(open) {
+            const drawer = document.getElementById('counselorDrawer');
+            const overlay = document.getElementById('drawerOverlay');
+            
+            if (open) {
+                drawer.classList.remove('translate-x-full');
+                overlay.classList.remove('hidden');
+                setTimeout(() => overlay.classList.add('opacity-100', 'pointer-events-auto'), 10);
+                document.body.classList.add('overflow-hidden');
+            } else {
+                drawer.classList.add('translate-x-full');
+                overlay.classList.remove('opacity-100', 'pointer-events-auto');
+                setTimeout(() => {
+                    overlay.classList.add('hidden');
+                }, 300);
+                document.body.classList.remove('overflow-hidden');
+            }
+        }
+
+        // Global keylistener for Cmd+K and Escape
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                document.querySelector('input[type="text"]').focus();
+            }
+            if (e.key === 'Escape') {
+                toggleDrawer(false);
+            }
+        });
+    </script>
+</body></html>

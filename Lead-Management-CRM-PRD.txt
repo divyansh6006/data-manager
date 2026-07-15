@@ -1,0 +1,331 @@
+Product Requirements Document
+Internal Lead Management & Counseling CRM
+For an Online MBA Education-Consulting Company
+Version 1.0 — Phase 1 Scope
+Status: In Design — Core Decisions Finalized, Screens Specified
+
+1. Executive Summary
+This document defines the requirements for an internal Lead Management CRM built for an education-consulting company that sells online MBA programs through a team of counselors. The company currently receives raw lead data from multiple sources (Naukri, LinkedIn, referrals, website forms) and manages distribution and follow-up manually through Excel, resulting in duplicate calling, lead leakage, unfair distribution, and no reliable reporting.
+The product replaces this with a structured pipeline: leads are uploaded, cleaned, filtered, and distributed by a defined allocation method; counselors work leads through three qualification stages (L1, L2, L3); and every action is logged for accountability. The system is intentionally low-AI — the differentiator is workflow discipline, access control, and auditability, not machine learning.
+Primary goal: prevent lead leakage and duplicate work, give managers real visibility into the pipeline, and keep the system maintainable long-term by a small team.
+
+2. Objectives & Success Criteria
+2.1 Objectives
+Eliminate duplicate calling by enforcing single-owner lead assignment.
+Give managers a fast, auditable way to distribute leads without spreadsheets.
+Give leadership real-time visibility into pipeline health and counselor performance.
+Prevent data leakage (copy/paste, exports, screenshots) as a first-class design constraint, not an afterthought.
+Keep the system maintainable by a small internal team or a lean external retainer.
+2.2 Success Criteria (Phase 1 launch)
+100% of new leads enter the system via upload — no more leads distributed by raw Excel/WhatsApp/manual handoff.
+Every lead has exactly one owning counselor at any point in time, enforced by the system (not by policy alone).
+Every tick, cross, remark, transfer, and export is logged and attributable to a user and timestamp.
+Managers can distribute a filtered batch of leads in under 2 minutes using Manual Count Allocation.
+All logins are restricted to company email domain accounts; no personal email access is possible.
+
+3. Roles & Permissions
+Role
+Upload
+Filter/Distribute
+See all leads
+Own leads only
+Reassign
+Export
+Reports
+Super Admin
+Yes
+Yes
+Yes
+–
+Yes
+Yes
+Full
+Manager/Ops
+Yes
+Yes
+Yes (team)
+–
+Yes (team)
+No / limited
+Team
+Team Leader
+No
+No
+Yes (team)
+–
+Yes (own team)
+No
+Team
+Counselor
+No
+No
+No
+Yes
+No (can request)
+No
+Self only
+Golden rule: a lead assigned to Counselor A is invisible and uneditable to Counselor B unless a Team Leader approves a transfer. This single rule is responsible for most of the anti-leakage and anti-duplication guarantees in this system.
+Each role authenticates through the same company-SSO login and is routed automatically to its own dashboard based on the account's assigned role. There is no client-side role switcher in the production system — role is enforced server-side.
+
+4. End-to-End Workflow
+Master/Manager uploads Excel (date-wise)        ↓System validates & cleans (dedupe, format phone/email, standardize city/experience)        ↓Manager applies filters (location, experience, source, date, course interest)        ↓Filtered pool → Distribution engine (Manual Count Allocation)        ↓Leads land in each Counselor's dashboard (locked to them only)        ↓L1 — Qualification (interested? eligible? wrong number? busy?)        ↓ (tick = qualifies, moves forward | cross = reason + closed)L2 — Counseling & Follow-ups (course/university discussion, EMI, follow-up dates)        ↓L3 — Closure (university selected, documents, application, admission/lost)        ↓Reports: per counselor, per team, per source, per day/week/month
+
+5. Data Model
+Leads
+id, name, phone, email, city, state, experience, current_company, salary, graduation, course_interest, source, upload_batch_id, status (raw/clean/duplicate/invalid), created_at
+Lead_Assignments
+id, lead_id, counselor_id, assigned_by, assigned_at, stage (L1/L2/L3), locked (bool)
+Lead_Activity_Log
+id, lead_id, counselor_id, action (tick/cross/note/call/status_change), remark, timestamp
+Follow_Ups
+id, lead_id, counselor_id, follow_up_date, notes, completed (bool)
+Closures
+id, lead_id, university_id, documents_status, application_status, final_status (enrolled/lost/hold), revenue
+Users
+id, name, company_email, role, team_id, device_id, active
+Universities
+id, name, courses, fees, eligibility, specializations
+Upload_Batches
+id, uploaded_by, file_name, upload_date, total_rows, clean_rows, duplicate_rows, invalid_rows
+Distribution_Batches
+id, source_batch_id, filter_criteria (JSON), total_leads, distributed_by, distributed_at, status (draft/confirmed)
+Distribution_Allocations
+id, distribution_batch_id, counselor_id, requested_count, actual_lead_ids, created_at
+Transfer_Requests
+id, lead_id, requested_by, request_type (give_up/request_lead/leader_initiated), reason, note, target_counselor_id, status (pending/approved/rejected), reviewed_by, reviewed_at, created_at
+Every lead-facing action writes to Lead_Activity_Log. This log is the backbone of both the audit/security requirements and the daily-operations reporting — it is not an optional add-on.
+
+6. Stage Definitions — L1 / L2 / L3
+L1 — Qualification
+Fields: Interested (Y/N), Working professional (Y/N), Rough budget, Eligible (Y/N)
+Outcomes: Interested → L2 | Not Interested / Wrong Number / Duplicate / Invalid → Closed (mandatory reason dropdown)
+L2 — Counseling & Follow-up
+Fields: University discussed, course, fee/EMI discussed, follow-up date, remark
+Can loop (Follow-up 1, 2, 3...) with a defined cap before auto-moving to Cold/Lost
+Follow-up due dates auto-surface the lead to the top of the counselor's dashboard
+L3 — Closure
+Fields: University finalized, documents received (checklist), application submitted, admission confirmed, revenue/fee collected
+Final status: Converted / Lost / On Hold
+Connects revenue reporting back to lead source, enabling source-level ROI analysis
+
+7. Distribution Logic — Manual Count Allocation (Decided, Phase 1)
+Flow:
+Manager filters the batch → sees total matching count.
+Screen shows each counselor with current unworked load + an editable count input.
+System validates allocated total equals available total, or leftover is explicitly marked unassigned.
+On confirm, leads are pulled in a defined sort order and assigned atomically — full batch succeeds or none does.
+Every distribution is logged: who, when, how many, to whom.
+Edge cases handled:
+Leads lock the moment they enter a draft distribution — prevents two managers double-assigning the same pool.
+Assigning to an inactive/on-leave counselor is blocked by default, with override + confirmation.
+Manager undo allowed only while a lead is untouched; once worked, correction requires the Team Leader transfer flow.
+Leads sorted meaningfully (experience or upload order) before manual split.
+Deferred to later phases: round-robin (continuous flow), tiered seniority-based split, and performance-weighted allocation — revisited once real conversion data exists.
+
+8. Reassignment / Transfer Approval Flow (Decided)
+Principle: once a counselor has made first contact, ownership can only change via request → approval → transfer. No direct counselor-to-counselor handoffs — a Team Leader is always in the loop.
+Trigger types:
+Counselor requests to give up a lead (reason via dropdown: language mismatch, wrong specialization, overloaded, candidate requested someone else).
+Counselor requests to receive a specific lead (e.g. personal referral) — requires manager sign-off.
+Team Leader/Manager-initiated (leave/exit, load rebalancing, performance intervention).
+Request (reason + note + optional target) → Team Leader queue (Pending)   → Lead stays workable by current owner during this window   → Team Leader approves / rejects / reassigns to someone else   → On approval: full history travels with the lead, old owner loses access   → Logged: requested_by, reason, approved_by, old_owner, new_owner, timestamp
+No auto-approval, ever — always a human sign-off.
+Approved transfers aren't reversible by the requester — a reversal is a new request.
+Pending requests unreviewed after 24 hours auto-escalate to the Manager.
+
+9. Security & Anti-Leakage Requirements
+Login restricted to @company.com via Google Workspace or Microsoft 365 SSO — no personal email access possible.
+One active device/session per counselor; new login kills the old session.
+Right-click, text-select, copy, cut, paste, print, and screenshot-key disabled on lead views. Note: 100% screenshot prevention is not achievable in a browser — watermarking (counselor name + timestamp) is the realistic deterrent.
+Full phone number masked until officially assigned; calling routed through click-to-call (Exotel/Knowlarity) so the raw number is never dialed manually or copyable.
+Export/download restricted to Super Admin; every export logged with who/when/how many rows.
+Session timeout after a configurable idle period.
+Full audit trail: every view, tick, cross, remark, and reassignment timestamped and attributed.
+
+
+10. Screens & UI Requirements
+All screens share a consistent visual system: dense, professional ops-software tone (not consumer-app styling), a neutral gray/white palette with one consistent accent color, a persistent left sidebar for navigation, and color-coded status badges (grey = raw, blue = assigned, green = converted, red = lost/invalid, amber = follow-up due).
+10.1 Login Flow
+Single shared entry point for all roles — no role picker. Role is determined server-side from the authenticated account and the user is redirected automatically to their role's dashboard.
+Centered login card: company logo, primary "Sign in with Google Workspace" button, secondary Microsoft 365 option.
+Domain restriction note visible: "Only @company.com accounts can access this system."
+Error state for wrong-domain login attempts.
+Device/session-conflict modal when signing in on a new device while another session is active.
+Brief branded loading transition before redirecting into the role-specific dashboard.
+10.2 Super Admin Dashboard
+System-health and governance view. Nav: Dashboard, Leads Workspace (oversight), Lead Distribution (oversight), User & Role Management, Security & Audit Log, System Settings.
+Server/system status, database row counts, SSO sync status.
+Active security policy list with ENFORCED/PARTIAL/DISABLED badges.
+Database backup log (ID, date, size, status).
+System compliance checklist panel.
+10.3 Manager/Ops Dashboard
+Daily operations view. Nav: Dashboard, Lead Upload, Lead Filtering & Distribution, Lead Management, Counselor & Team Management, Reports & Analytics, University Master Data.
+Today's upload summary with clean/duplicate/invalid breakdown.
+Leads pending distribution, with a direct "Distribute Now" action.
+Team-wide conversion funnel (L1→L2→L3→Converted).
+Counselor load-balance snapshot flagging over/under-loaded counselors.
+Operational activity feed (uploads, distributions, closures).
+10.4 Team Leader Dashboard
+Team-scoped management view. Nav: Dashboard, My Team's Leads, Transfer Approval Queue, Team Performance, Team Roster.
+Transfer/reassignment approval queue front-and-center with SLA countdown badges.
+Per-counselor pipeline breakdown for the team only.
+Team conversion rate, week-over-week.
+Follow-ups-due-today list aggregated across the team.
+10.5 Counselor Dashboard
+The highest-frequency screen in the system — optimized for speed. Nav: My Leads, Follow-ups Due, My Performance only (no admin/upload/distribution options visible).
+Summary strip: counts by stage (L1/L2/L3) plus follow-ups-due-today.
+Working table with inline tick/cross/remark actions per row — no page navigation required to process a lead.
+Click-to-call icon instead of a visible phone number.
+"Request Transfer" action opening a reason-dropdown modal.
+Personal performance strip (own numbers only, no team comparison).
+10.6 Lead Upload
+Drag-and-drop/file-picker for Excel/CSV.
+Column-mapping preview after upload with manual remap option.
+Summary strip before import confirmation (total/clean/duplicate/invalid counts, each drillable).
+Loading and success states, with a link into Lead Management for the new batch.
+10.7 Lead Filtering & Pool View
+Combinable filter bar: location, experience range, source, upload date range, course interest, status.
+Results table with a running match count.
+"Send to Distribution" primary action; saved filter presets.
+Empty state for no matching leads.
+10.8 Lead Distribution (Manual Count Allocation)
+Available-pool count shown at top.
+Per-counselor table: current load + editable allocation input.
+Live-updating Available / Allocated / Remaining totals.
+Confirm button disabled until totals reconcile; confirmation modal before atomic submit.
+Validation/error state for mismatched totals; distinct treatment for on-leave counselors.
+10.9 Counselor & Team Management
+Counselor table: name, role, team, status, current load, quick actions.
+Detail drawer per counselor: pipeline breakdown, recent activity, profile info.
+Add Counselor action; search/filter by team, status, role.
+10.10 Transfer/Reassignment Approval Queue
+Queue of pending requests: lead, requester, reason, target, time pending, SLA countdown badge.
+Approve/Reject actions requiring a note.
+Tabs: Pending My Review / Escalated to Manager / Resolved History.
+Empty state: "No pending transfer requests."
+10.11 Reports & Analytics
+Date-range picker.
+Conversion funnel by team/counselor/source.
+Counselor leaderboard (admissions, talk-time, follow-ups).
+Lead-source ROI comparison.
+Export controls with a visible "this export will be logged" indicator.
+10.12 Lead Management / Master Lead Repository
+System-wide summary strip: total leads, stage breakdown, unassigned count emphasized.
+Filter/group by upload batch and date, stage, status, counselor, source, team.
+Full table: name, masked phone, email, city, experience, source, upload date/batch, counselor, stage, status, last activity.
+Row click opens full lead detail + complete activity timeline + stage-transition history.
+10.13 University & Course Master Data
+CRUD table: university, courses, fees, eligibility, specializations.
+Add/Edit/Delete actions with detail modal for course/fee editing.
+10.14 Audit Log / Security View
+Searchable/filterable log: timestamp, user, action type, target record, note.
+Filters for date range, user, action type; prominent search.
+Technical, console-like visual tone distinct from the rest of the app.
+10.15 Settings
+Company email domain restriction config.
+Session timeout duration.
+Role & permission matrix editor.
+Integrations: Exotel/Knowlarity API keys, SSO configuration.
+Independent Save action per section.
+
+
+11. Tech Stack
+Frontend: React
+Backend: Node.js (NestJS or Express)
+Database: PostgreSQL
+Cache/Queues: Redis (distribution logic, follow-up reminders)
+Auth: Google Workspace SSO or Microsoft 365 SSO
+Calling: Exotel or Knowlarity (click-to-call + recording)
+Hosting: AWS or DigitalOcean, daily automated Postgres backups
+File processing: Server-side Excel/CSV parsing and validation
+This stack is deliberately conventional — an internal ops tool that a small team maintains for years benefits from boring, well-understood technology over novelty.
+
+12. Team & Timeline
+12.1 Team Needed
+1 Backend developer (data model, distribution logic, permissions)
+1 Frontend developer (dashboards, upload flow, L1/L2/L3 UI)
+1 part-time DevOps/infra (hosting, backups, SSO)
+Product owner (defines filter rules, stage definitions, distribution logic)
+12.2 Rough Timeline
+Weeks 1–2: Data model, auth/SSO, upload + validation
+Weeks 3–4: Distribution engine + counselor dashboard + L1/L2/L3 flow
+Weeks 5–6: Locking, activity logs, anti-copy/paste, manager view
+Weeks 7–8: Testing with anonymized real data, bug fixing, pilot launch
+Phase 2 (weeks 9–14): Filters, follow-up automation, reassignment workflow, click-to-call
+Phase 3 (ongoing): Dedup/cleaning rules, analytics, WhatsApp integration
+
+13. Maintenance Plan
+Task
+Frequency
+Owner
+Upload new lead batches
+Daily/as received
+Ops/Manager
+Review duplicate/invalid flagged rows
+Daily
+Ops
+Monitor distribution fairness
+Weekly
+Manager
+Review activity logs for suspicious access
+Weekly
+Admin
+Reconcile L3 closures with revenue records
+Weekly
+Admin/Finance
+Database backups
+Daily automated
+Dev/DevOps
+Server & security patching
+Monthly
+Dev/DevOps
+Add new universities/courses to master data
+As needed
+Ops
+Review and prune stale/cold leads
+Monthly
+Manager
+Bug fixes / small feature requests
+Ongoing (retainer)
+Dev team
+Implication: this system needs either an in-house junior dev/ops hire or a small monthly retainer post-launch. It is never "done" — it needs a caretaker.
+
+14. Decision Log
+Decided
+Distribution logic (Phase 1): Manual Count Allocation (Section 7).
+Reassignment/transfers: Team Leader approval required, 24-hour SLA to Manager escalation (Section 8).
+Role-based login and dashboards: single SSO login, server-side role routing, four fully distinct dashboards (Section 10).
+Still Open
+Follow-up cap for L2 — number of missed follow-ups before auto-move to Cold/Lost.
+Number masking approach — masked-then-revealed vs. permanently masked with click-to-call only.
+Maintenance ownership post-launch — in-house hire vs. dev-team retainer.
+
+
+15. Final Product Definition — Phase 1 Acceptance Criteria
+This section defines what "done" means for Phase 1 launch. The product is considered complete and ready for pilot rollout when every item below is true.
+Access & Roles
+☐  Login works only via company-domain SSO; no personal email can authenticate.
+☐  Each of the 4 roles is routed automatically to its own distinct dashboard on login — no manual role switcher exists anywhere in the UI.
+☐  A Counselor cannot view, edit, or query any lead not currently assigned to them.
+☐  A Manager/Team Leader can only see leads/counselors within their own scope (team-level, not company-wide, for Team Leaders).
+Upload & Data Quality
+☐  Excel/CSV upload correctly parses all required fields and flags duplicate/invalid rows before import is confirmed.
+☐  Every upload creates a traceable batch record (who, when, row counts) visible in Lead Management.
+Distribution
+☐  Manual Count Allocation distributes a filtered batch atomically — partial/failed distributions never leave leads unassigned or duplicated.
+☐  Two managers cannot simultaneously distribute overlapping leads from the same filtered pool.
+Pipeline & Transfers
+☐  Every lead can be tracked through L1 → L2 → L3 with all required fields captured at each stage.
+☐  Transfer requests cannot bypass Team Leader approval; approved transfers carry full history to the new owner.
+☐  Transfer requests unreviewed after 24 hours visibly escalate to the Manager queue.
+Security & Audit
+☐  Copy, cut, paste, right-click, and print are disabled on all lead-data views.
+☐  Phone numbers are masked according to the agreed masking approach; calls route through click-to-call.
+☐  Every tick, cross, remark, transfer, export, and login event is captured in the Audit Log with user and timestamp.
+☐  Exports are restricted to Super Admin and are individually logged.
+Reporting
+☐  Manager and Team Leader dashboards reflect real-time (or near-real-time) pipeline counts.
+☐  Reports can be filtered by date range, team, counselor, and lead source.
+Operational Readiness
+☐  Daily automated database backups are running and verified.
+☐  A named owner (in-house or retainer) is assigned for post-launch maintenance before pilot rollout begins.
