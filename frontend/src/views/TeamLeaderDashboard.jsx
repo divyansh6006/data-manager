@@ -18,6 +18,8 @@
  */
 
 import React, { useState, useEffect } from 'react';
+import { getStatusStyle, getTodayISTDateString } from '../utils/statusStyles';
+import RemarksModal from '../components/RemarksModal';
 
 // Reusable Masked Phone Component
 const MaskedPhone = ({ phone }) => {
@@ -160,6 +162,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
   const [forwardedLeads, setForwardedLeads] = useState([]);
   const [forwardedLoading, setForwardedLoading] = useState(false);
   const [resolveModalLead, setResolveModalLead] = useState(null);
+  const [remarksModalLead, setRemarksModalLead] = useState(null);
   const [resolveAction, setResolveAction] = useState('send_back');
   const [resolveTargetCounselor, setResolveTargetCounselor] = useState('');
   const [resolveRemark, setResolveRemark] = useState('');
@@ -168,15 +171,20 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
   const [droppedLoading, setDroppedLoading] = useState(false);
   const [droppedSearchQuery, setDroppedSearchQuery] = useState('');
 
-  const [metrics, setMetrics] = useState({ stages: [], closures: [], unassigned: 0 });
+  const [metrics, setMetrics] = useState({ statusCounts: [], notContactableBreakdown: [], leadPunchedBreakdown: { registrationStatus: [], feePaymentStatus: [] }, unassigned: 0, closuresSummary: [], leadTemperatureBreakdown: [] });
+  const [dataReport, setDataReport] = useState({ perCounselor: [], aggregate: { openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0 } });
   const [leaderboard, setLeaderboard] = useState([]);
   const [sourceBreakdown, setSourceBreakdown] = useState([]);
   const [reportsLoading, setReportsLoading] = useState(false);
 
   const [forwardedSearchQuery, setForwardedSearchQuery] = useState('');
+  const [forwardedCategoryFilter, setForwardedCategoryFilter] = useState('All');
+
+  // Must mirror ESCALATION_CATEGORIES in backend/src/index.js
+  const ESCALATION_CATEGORIES = ['Finance Issue', 'Time Constraint', 'Decision Delay', 'Placement Concern', 'Other'];
 
   // Daily Status Tracker States
-  const [trackingDate, setTrackingDate] = useState(new Date().toISOString().slice(0, 10));
+  const [trackingDate, setTrackingDate] = useState(getTodayISTDateString());
   const [trackingLoading, setTrackingLoading] = useState(false);
   const [trackingData, setTrackingData] = useState(null);
   const [trackingCategory, setTrackingCategory] = useState('all');
@@ -195,7 +203,59 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
   useEffect(() => {
     fetchCounselors();
     fetchReports();
+    fetchTransferQueue();
   }, []);
+
+  // Live polling: pick up transfer requests counselors submit without needing a manual refresh.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchTransferQueue(true);
+    }, 8000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Live polling: keep the counselor roster (load/targets) fresh regardless of tab,
+  // since it feeds the transfer/escalation resolution dropdowns at all times.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      fetchCounselors();
+    }, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Live polling: Activity Log Feed — show counselor actions (calls, ticks, drops) as
+  // they happen instead of only after clicking "Apply Filters".
+  useEffect(() => {
+    if (activeTab !== 'activity') return;
+    const interval = setInterval(() => {
+      fetchActivityLogs({
+        counselor_id: activityCounselorFilter,
+        action_type: activityActionFilter,
+        date_from: activityDateFrom,
+        date_to: activityDateTo,
+        search: activitySearch
+      }, true);
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [activeTab, activityCounselorFilter, activityActionFilter, activityDateFrom, activityDateTo, activitySearch]);
+
+  // Live polling: Daily Tracker — reflect today's calls/drops/enrollments as they happen.
+  useEffect(() => {
+    if (activeTab !== 'tracking') return;
+    const interval = setInterval(() => {
+      fetchDailyTracking(trackingDate, true);
+    }, 8000);
+    return () => clearInterval(interval);
+  }, [activeTab, trackingDate]);
+
+  // Live polling: Team Performance reports / counselor leaderboard.
+  useEffect(() => {
+    if (activeTab !== 'reports') return;
+    const interval = setInterval(() => {
+      fetchReports(true);
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [activeTab]);
 
   const fetchCounselors = async () => {
     try {
@@ -211,30 +271,32 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
     }
   };
 
-  const fetchReports = async () => {
-    setReportsLoading(true);
+  const fetchReports = async (silent = false) => {
+    if (!silent) setReportsLoading(true);
     try {
       const headers = { 'Authorization': `Bearer ${token}` };
-      const [pipelineRes, leaderboardRes, sourceRes] = await Promise.all([
-        fetch('/api/reports/pipeline', { headers }),
+      const [statusRes, dataReportRes, leaderboardRes, sourceRes] = await Promise.all([
+        fetch('/api/reports/data-status', { headers }),
+        fetch('/api/reports/data-report', { headers }),
         fetch('/api/reports/counselor-leaderboard', { headers }),
         fetch('/api/reports/source-breakdown', { headers })
       ]);
 
-      if (pipelineRes.ok && leaderboardRes.ok && sourceRes.ok) {
-        setMetrics(await pipelineRes.json());
+      if (statusRes.ok && dataReportRes.ok && leaderboardRes.ok && sourceRes.ok) {
+        setMetrics(await statusRes.json());
+        setDataReport(await dataReportRes.json());
         setLeaderboard(await leaderboardRes.json());
         setSourceBreakdown(await sourceRes.json());
       }
     } catch (err) {
       console.error('Failed to fetch team reports', err);
     } finally {
-      setReportsLoading(false);
+      if (!silent) setReportsLoading(false);
     }
   };
 
-  const fetchDailyTracking = async (date) => {
-    setTrackingLoading(true);
+  const fetchDailyTracking = async (date, silent = false) => {
+    if (!silent) setTrackingLoading(true);
     try {
       const response = await fetch(`/api/leads/daily-tracking?date=${date}`, {
         headers: { 'Authorization': `Bearer ${token}` }
@@ -242,19 +304,19 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
       const data = await response.json();
       if (response.ok) {
         setTrackingData(data);
-        setTrackingCategory('all');
+        if (!silent) setTrackingCategory('all');
       } else {
         console.error('Tracking error:', data.error);
       }
     } catch (err) {
       console.error(err);
     } finally {
-      setTrackingLoading(false);
+      if (!silent) setTrackingLoading(false);
     }
   };
 
-  const fetchActivityLogs = async (params = {}) => {
-    setActivityLoading(true);
+  const fetchActivityLogs = async (params = {}, silent = false) => {
+    if (!silent) setActivityLoading(true);
     try {
       const query = new URLSearchParams();
       if (params.counselor_id || activityCounselorFilter) query.append('counselor_id', params.counselor_id ?? activityCounselorFilter);
@@ -275,12 +337,12 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
     } catch (err) {
       console.error(err);
     } finally {
-      setActivityLoading(false);
+      if (!silent) setActivityLoading(false);
     }
   };
 
-  const fetchTransferQueue = async () => {
-    setTransfersLoading(true);
+  const fetchTransferQueue = async (silent = false) => {
+    if (!silent) setTransfersLoading(true);
     try {
       const response = await fetch('/api/transfers/queue', {
         headers: { 'Authorization': `Bearer ${token}` }
@@ -292,7 +354,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
     } catch (err) {
       console.error(err);
     } finally {
-      setTransfersLoading(false);
+      if (!silent) setTransfersLoading(false);
     }
   };
 
@@ -465,7 +527,12 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
               style={activeTab === 'transfers' ? { background: '#1BACE4' } : {}}
             >
               <span className="material-symbols-outlined text-lg">swap_horiz</span>
-              <span>Transfer Approvals</span>
+              <span className="flex-grow text-left">Transfer Approvals</span>
+              {transferRequests.length > 0 && (
+                <span key={transferRequests.length} className="ml-1 shrink-0 min-w-[18px] h-[18px] px-1 flex items-center justify-center rounded-full text-[10px] font-bold bg-[#EF4444] text-white animate-badge-pop">
+                  {transferRequests.length}
+                </span>
+              )}
             </button>
             <button
               onClick={(e) => {
@@ -507,7 +574,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
       </div>
 
       {/* Main Content Area */}
-      <div className="flex-grow flex flex-col min-w-0">
+      <div className="flex-grow flex flex-col h-screen overflow-hidden min-w-0">
         
         {/* Header */}
         <header className="h-14 bg-white border-b border-[#CBD5E1] flex items-center justify-between px-6 shrink-0">
@@ -535,27 +602,135 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
           {activeTab === 'reports' && (
             <div className="space-y-6">
               
-              {/* Performance Cards */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
-                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Total L1 Leads</p>
-                  <p className="text-2xl font-black text-[#1BACE4] mt-1 font-headline-lg">
-                    {metrics.stages.find(s => s.stage === 'L1')?.count || 0}
-                  </p>
-                </div>
-                <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
-                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Total L2 Leads</p>
-                  <p className="text-2xl font-black text-purple-700 mt-1 font-headline-lg">
-                    {metrics.stages.find(s => s.stage === 'L2')?.count || 0}
-                  </p>
-                </div>
-                <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
-                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Admission Closures (L3 Won)</p>
-                  <p className="text-2xl font-black text-green-700 mt-1 font-headline-lg">
-                    {metrics.closures.find(c => c.final_status === 'enrolled')?.count || 0}
-                  </p>
-                </div>
-              </div>
+              {/* Daily Data Report — Carry Forward composition + contact funnel.
+                  Not Interested / Job Seeker / Duplicate Lead are terminal statuses: the
+                  moment a counselor sets them, their lead_assignments row is deleted and a
+                  closures row is written instead (see migration
+                  20260718000000_add_counseling_status_to_assignments.js), so those three
+                  counts must be read from metrics.closuresSummary, never from
+                  metrics.statusCounts — the latter would just show ~0 for them. */}
+              {(() => {
+                const { openingCF, freshBase, totalBase, touchPct, cfAhead, cfPending, cfClosedToday, cfOriginalTotal } = dataReport.aggregate;
+                const notContactedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Not Contacted')?.count || 0, 10);
+                const interestedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Interested')?.count || 0, 10);
+                const callBackCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Call Back')?.count || 0, 10);
+                const coldCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Cold')?.count || 0, 10);
+                const notContactableCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Not Contactable')?.count || 0, 10);
+                const leadPunchedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Lead Punched')?.count || 0, 10);
+                const notInterestedCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'lost')?.count || 0, 10);
+                const jobSeekerCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'job_seeker')?.count || 0, 10);
+                const duplicateCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'duplicate')?.count || 0, 10);
+                const enrolledCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'enrolled')?.count || 0, 10);
+                const hotLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Hot')?.count || 0, 10);
+                const warmLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Warm')?.count || 0, 10);
+                const coldLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Cold')?.count || 0, 10);
+                const connectedCount = Math.max(totalBase - notContactedCount, 0);
+                const connectedPct = totalBase > 0 ? Math.round((connectedCount / totalBase) * 1000) / 10 : 0;
+
+                return (
+                  <div className="space-y-4">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 font-label-caps flex items-center gap-2">
+                      <span className="material-symbols-outlined text-[#1BACE4] text-base">event_repeat</span>
+                      Daily Data Report — Carry Forward &amp; Contact Funnel
+                    </h3>
+
+                    {/* Base composition */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                      <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Opening Carry Forward</p>
+                        <p className="text-2xl font-black text-amber-600 mt-1 font-headline-lg">{cfOriginalTotal}</p>
+                        <p className="text-[10px] text-slate-400 mt-1">Un-worked leads rolled over from earlier uploads (e.g. 16 Jul data still open on 18 Jul)</p>
+                        <div className="flex items-center gap-3 mt-2 pt-2 border-t border-slate-100 text-[10px] font-bold">
+                          <span className="text-[#1BACE4]">Ahead: {cfAhead + cfClosedToday}</span>
+                          <span className="text-slate-500">Pending: {cfPending}</span>
+                        </div>
+                        {cfClosedToday > 0 && (
+                          <p className="text-[9px] text-slate-400 mt-1">Includes {cfClosedToday} CF lead{cfClosedToday === 1 ? '' : 's'} closed out today ({openingCF} still open)</p>
+                        )}
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Fresh Base (Today)</p>
+                        <p className="text-2xl font-black text-green-700 mt-1 font-headline-lg">{freshBase}</p>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Touch%</p>
+                        <p className="text-2xl font-black text-[#1BACE4] mt-1 font-headline-lg">{touchPct}%</p>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-5 rounded-lg shadow-sm">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Admission Closures (Enrolled)</p>
+                        <p className="text-2xl font-black text-green-700 mt-1 font-headline-lg">{enrolledCount}</p>
+                      </div>
+                    </div>
+
+                    {/* Contact funnel: contacted leads shunt out of the main (Not Contacted) pool into their own category */}
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Not Contacted</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Contacted').color }}>{notContactedCount}</div>
+                        <div className="text-[10px] text-slate-400 mt-1">Still sitting in the main pool</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Connected</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-[#1BACE4]">{connectedCount}</div>
+                        <div className="text-[10px] text-slate-400 mt-1">{connectedPct}% of total base — contacted &amp; moved out</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Interested</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Interested').color }}>{interestedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Not Interested</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Interested').color }}>{notInterestedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Job Seeker</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Job Seeker').color }}>{jobSeekerCount}</div>
+                      </div>
+                    </div>
+
+                    {/* Secondary breakdown */}
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Call Back</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Call Back').color }}>{callBackCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Cold</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Cold').color }}>{coldCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Not Contactable</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Contactable').color }}>{notContactableCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Lead Punched</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Lead Punched').color }}>{leadPunchedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">Duplicate Lead</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Duplicate Lead').color }}>{duplicateCount}</div>
+                      </div>
+                    </div>
+
+                    {/* Lead Temperature — sales intent on Interested/Lead Punched/Duplicate
+                        Lead leads, independent of the 'Cold' counseling_status above */}
+                    <div className="grid grid-cols-3 gap-4">
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">🔥 Hot Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-red-600">{hotLeadCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">🌤️ Warm Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-amber-600">{warmLeadCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#CBD5E1] p-4 rounded-lg shadow-sm">
+                        <span className="text-[11px] text-slate-500 font-label-caps uppercase">❄️ Cold Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-sky-600">{coldLeadCount}</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Roster Leaderboard Grid */}
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -572,9 +747,9 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                       <thead className="bg-[#F8FAFC] border-b border-[#E2E8F0]">
                         <tr className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">
                           <th className="p-3 pl-4">Counselor</th>
-                          <th className="p-3 text-center">L1 active</th>
-                          <th className="p-3 text-center">L2 active</th>
-                          <th className="p-3 text-center">L3 active</th>
+                          <th className="p-3 text-center">Opening CF</th>
+                          <th className="p-3 text-center">Fresh Base</th>
+                          <th className="p-3 text-center">Touch%</th>
                           <th className="p-3 text-center text-green-700">Enrolled (Won)</th>
                           <th className="p-3 text-center text-[#BA1A1A]">Dropped (Lost)</th>
                           <th className="p-3 pr-4 text-right">Revenue</th>
@@ -588,9 +763,9 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                         ) : leaderboard.map((c, i) => (
                           <tr key={c.id || i} className="hover:bg-slate-50 transition">
                             <td className="p-3 pl-4 font-semibold text-slate-800">{c.name}</td>
-                            <td className="p-3 text-center font-data-mono">{c.L1}</td>
-                            <td className="p-3 text-center font-data-mono">{c.L2}</td>
-                            <td className="p-3 text-center font-data-mono">{c.L3}</td>
+                            <td className="p-3 text-center font-data-mono">{c.openingCF}</td>
+                            <td className="p-3 text-center font-data-mono">{c.freshBase}</td>
+                            <td className="p-3 text-center font-data-mono">{c.touchPct}%</td>
                             <td className="p-3 text-center font-bold text-green-700 font-data-mono">{c.enrolled}</td>
                             <td className="p-3 text-center font-bold text-[#BA1A1A] font-data-mono">{c.lost}</td>
                             <td className="p-3 pr-4 text-right font-data-mono font-semibold">₹{(c.revenue || 0).toLocaleString('en-IN')}</td>
@@ -642,7 +817,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                     <input
                       type="date"
                       value={trackingDate}
-                      max={new Date().toISOString().slice(0,10)}
+                      max={getTodayISTDateString()}
                       onChange={(e) => { setTrackingDate(e.target.value); }}
                       className="text-xs p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#059669]"
                     />
@@ -671,21 +846,66 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                 </div>
               )}
 
-              {!trackingLoading && trackingData && (
+              {!trackingLoading && trackingData && (() => {
+                // 'dropped' from the backend lumps Not Interested / Job Seeker / Duplicate
+                // Lead together (they all leave lead_assignments the same way once a
+                // counselor closes them out — see /api/leads/daily-tracking). Each entry
+                // still carries its own final_status, so split them back out client-side
+                // for the categories the user actually wants broken out on this panel.
+                const droppedList = trackingData.categories.dropped || [];
+                const notInterestedList = droppedList.filter(l => l.final_status === 'lost');
+                const jobSeekerList = droppedList.filter(l => l.final_status === 'job_seeker');
+                const duplicateList = droppedList.filter(l => l.final_status === 'duplicate');
+                const connectedCount = trackingData.summary.total - trackingData.summary.notContacted;
+                const categories = { ...trackingData.categories, notInterested: notInterestedList, jobSeeker: jobSeekerList, duplicate: duplicateList };
+
+                const cf = trackingData.cfProgress || { openingCF: 0, cfAhead: 0, cfPending: 0, cfClosedToday: 0, cfOriginalTotal: 0 };
+                const cfAheadTotal = cf.cfAhead + cf.cfClosedToday;
+
+                return (
                 <>
+                  {/* Carry Forward Progress — opening pool for the day vs how much has moved ahead vs is still pending */}
+                  <div className="bg-[#EFF9FF] border-2 border-[#BAE6FD] rounded-xl p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-[#0F4C5C] font-label-caps">Carry Forward Progress — {trackingData.date}</span>
+                        <p className="text-[10px] text-[#40484B] mt-0.5">Contacted leads shunt out of the main (Not Contacted) pool into their own category</p>
+                      </div>
+                      <div className="flex items-center gap-5">
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-amber-600">{cf.cfOriginalTotal}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Opening CF</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-[#1BACE4]">{cfAheadTotal}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Ahead</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-slate-500">{cf.cfPending}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Pending</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-[#0F4C5C]">{connectedCount}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Connected</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Summary Pills */}
-                  <div className="grid grid-cols-5 gap-3">
+                  <div className="grid grid-cols-3 md:grid-cols-5 lg:grid-cols-9 gap-3">
                     {[
-                      { key: 'all',          label: 'All Activity',    count: trackingData.summary.total,        color: '#505F76', bg: '#F8FAFC',   border: '#CBD5E1' },
-                      { key: 'L1',           label: 'Level 1',         count: trackingData.summary.L1,           color: '#1BACE4', bg: '#EFF9FF',   border: '#BAE6FD' },
-                      { key: 'L2',           label: 'Level 2',         count: trackingData.summary.L2,           color: '#8B5CF6', bg: '#F5F3FF',   border: '#DDD6FE' },
-                      { key: 'L3',           label: 'Level 3',         count: trackingData.summary.L3,           color: '#059669', bg: '#ECFDF5',   border: '#A7F3D0' },
-                      { key: 'interested',   label: 'Interested',      count: trackingData.summary.interested,   color: '#10B981', bg: '#F0FDF4',   border: '#86EFAC' },
-                      { key: 'enrolled',     label: 'Enrolled ✓',      count: trackingData.summary.enrolled,     color: '#0F4C5C', bg: '#F0F9FF',   border: '#7DD3FC' },
-                      { key: 'not_interested', label: 'Not Interested',count: trackingData.summary.not_interested, color: '#EF4444', bg: '#FEF2F2', border: '#FECACA' },
-                      { key: 'not_picked_up',  label: 'Not Picked Up', count: trackingData.summary.not_picked_up,  color: '#F59E0B', bg: '#FFFBEB', border: '#FDE68A' },
-                      { key: 'switched_off',   label: 'Switched Off',  count: trackingData.summary.switched_off,   color: '#64748B', bg: '#F8FAFC', border: '#CBD5E1' },
-                      { key: 'dropped',      label: 'Dropped/Lost',    count: trackingData.summary.dropped,      color: '#BA1A1A', bg: '#FFF1F2',   border: '#FECDD3' },
+                      { key: 'all',            label: 'All Leads',       count: trackingData.summary.total,        color: '#505F76', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'notContacted',   label: 'Not Contacted',   count: trackingData.summary.notContacted, color: '#64748B', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'interested',     label: 'Interested',      count: trackingData.summary.interested,   color: '#10B981', bg: '#F0FDF4',   border: '#86EFAC' },
+                      { key: 'callBack',       label: 'Call Back',      count: trackingData.summary.callBack,     color: '#0D9488', bg: '#F0FDFA',   border: '#99F6E4' },
+                      { key: 'cold',           label: 'Cold',           count: trackingData.summary.cold,         color: '#94A3B8', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'notContactable', label: 'Not Contactable', count: trackingData.summary.notContactable, color: '#F59E0B', bg: '#FFFBEB', border: '#FDE68A' },
+                      { key: 'leadPunched',    label: 'Lead Punched',    count: trackingData.summary.leadPunched,  color: '#1BACE4', bg: '#EFF9FF',   border: '#BAE6FD' },
+                      { key: 'enrolled',       label: 'Enrolled ✓',      count: trackingData.summary.enrolled,     color: '#0F4C5C', bg: '#F0F9FF',   border: '#7DD3FC' },
+                      { key: 'notInterested',  label: 'Not Interested',  count: notInterestedList.length,          color: '#EF4444', bg: '#FFF1F2',   border: '#FECDD3' },
+                      { key: 'jobSeeker',      label: 'Job Seeker',      count: jobSeekerList.length,               color: '#FB923C', bg: '#FFF7ED',   border: '#FDBA74' },
+                      { key: 'duplicate',      label: 'Duplicate Lead',  count: duplicateList.length,               color: '#8B5CF6', bg: '#F5F3FF',   border: '#DDD6FE' },
                     ].map(pill => (
                       <button
                         key={pill.key}
@@ -710,18 +930,19 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                         <span className="material-symbols-outlined text-sm text-[#059669]">group</span>
                         {
                           trackingCategory === 'all' ? 'All Active Leads' :
-                          trackingCategory === 'L1' ? 'Level 1 Leads' :
-                          trackingCategory === 'L2' ? 'Level 2 Leads' :
-                          trackingCategory === 'L3' ? 'Level 3 Leads' :
+                          trackingCategory === 'notContacted' ? 'Not Contacted Leads' :
                           trackingCategory === 'interested' ? 'Interested Leads' :
+                          trackingCategory === 'callBack' ? 'Call Back Leads' :
+                          trackingCategory === 'cold' ? 'Cold Leads' :
+                          trackingCategory === 'notContactable' ? 'Not Contactable Leads' :
+                          trackingCategory === 'leadPunched' ? 'Lead Punched Leads' :
                           trackingCategory === 'enrolled' ? 'Enrolled Leads' :
-                          trackingCategory === 'not_interested' ? 'Not Interested' :
-                          trackingCategory === 'not_picked_up' ? 'Not Picked Up' :
-                          trackingCategory === 'switched_off' ? 'Switched Off' :
-                          'Dropped / Lost Leads'
+                          trackingCategory === 'notInterested' ? 'Not Interested Leads' :
+                          trackingCategory === 'jobSeeker' ? 'Job Seeker Leads' :
+                          'Duplicate Leads'
                         }
                         <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-data-mono">
-                          {(trackingData.categories[trackingCategory] || []).length} leads
+                          {(categories[trackingCategory] || []).length} leads
                         </span>
                       </h3>
                       <div className="flex items-center gap-2">
@@ -737,7 +958,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                     </div>
 
                     {(() => {
-                      const rows = (trackingData.categories[trackingCategory] || []).filter(lead => {
+                      const rows = (categories[trackingCategory] || []).filter(lead => {
                         if (!trackingSearch) return true;
                         const q = trackingSearch.toLowerCase();
                         return (
@@ -770,19 +991,14 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                                 <th className="p-3">Course Interest</th>
                                 <th className="p-3">Company</th>
                                 <th className="p-3">Counselor</th>
-                                <th className="p-3 text-center">Stage</th>
-                                <th className="p-3">Disposition</th>
+                                <th className="p-3 text-center">Status</th>
                                 <th className="p-3">Today's Activity</th>
                                 <th className="p-3">Last Updated</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-[#F0F4F8] font-body-sm">
                               {rows.map(lead => {
-                                const stageColors = { L1: '#1BACE4', L2: '#8B5CF6', L3: '#059669' };
-                                const dispColors = {
-                                  'Interested': '#10B981', 'Not Interested': '#EF4444',
-                                  'Not Picked Up': '#F59E0B', 'Switched Off': '#64748B', 'None': '#CBD5E1'
-                                };
+                                const status = lead.counseling_status || (lead.final_status ? lead.final_status : 'Not Contacted');
                                 return (
                                   <tr key={lead.id} className="hover:bg-[#F8FAFC] transition">
                                     <td className="p-3 pl-4">
@@ -802,18 +1018,9 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                                       <span className="text-[11px] font-semibold text-[#111C2D]">{lead.counselor_name || '—'}</span>
                                     </td>
                                     <td className="p-3 text-center">
-                                      {lead.stage ? (
-                                        <span className="inline-block px-2 py-0.5 rounded text-white text-[10px] font-bold font-data-mono" style={{ background: stageColors[lead.stage] || '#CBD5E1' }}>
-                                          {lead.stage}
-                                        </span>
-                                      ) : '—'}
-                                    </td>
-                                    <td className="p-3">
-                                      {lead.disposition && lead.disposition !== 'None' ? (
-                                        <span className="text-[10px] font-semibold" style={{ color: dispColors[lead.disposition] || '#505F76' }}>
-                                          {lead.disposition}
-                                        </span>
-                                      ) : <span className="text-[10px] text-[#CBD5E1]">None</span>}
+                                      <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(status).badge}`}>
+                                        {status}
+                                      </span>
                                     </td>
                                     <td className="p-3">
                                       {(lead.activity_today || []).length > 0 ? (
@@ -823,11 +1030,14 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                                               <span className="font-bold text-[#0F4C5C]">[{act.action}]</span> {act.remark ? act.remark.slice(0, 40) : ''}{act.remark && act.remark.length > 40 ? '...' : ''}
                                             </div>
                                           ))}
-                                          {(lead.activity_today || []).length > 3 && (
-                                            <div className="text-[10px] text-[#1BACE4] font-bold">+{(lead.activity_today || []).length - 3} more</div>
-                                          )}
                                         </div>
                                       ) : <span className="text-[10px] text-[#CBD5E1] italic">No actions</span>}
+                                      <button
+                                        onClick={() => setRemarksModalLead(lead)}
+                                        className="text-[10px] text-[#1BACE4] font-bold hover:underline mt-0.5"
+                                      >
+                                        View all remarks
+                                      </button>
                                     </td>
                                     <td className="p-3 text-[10px] text-[#70787C] font-data-mono">
                                       {lead.assignment_updated_at
@@ -844,7 +1054,8 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                     })()}
                   </div>
                 </>
-              )}
+                );
+              })()}
             </div>
           )}
 
@@ -924,7 +1135,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                     <input
                       type="date"
                       value={activityDateTo}
-                      max={new Date().toISOString().slice(0,10)}
+                      max={getTodayISTDateString()}
                       onChange={(e) => setActivityDateTo(e.target.value)}
                       className="w-full text-xs p-2 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#7C3AED]"
                     />
@@ -1099,13 +1310,13 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                             </td>
                             <td className="p-3 pr-4 text-center flex items-center justify-center gap-1.5">
                               <button
-                                onClick={() => { setSelectedRequest(req); setResolutionType('approved'); }}
+                                onClick={() => { setSelectedRequest(req); setResolutionType('approved'); setOverrideTarget(''); setResolutionNote(''); }}
                                 className="px-2 py-1 bg-green-600 hover:bg-green-700 text-white font-bold rounded text-[10px] uppercase transition"
                               >
                                 Approve
                               </button>
                               <button
-                                onClick={() => { setSelectedRequest(req); setResolutionType('rejected'); }}
+                                onClick={() => { setSelectedRequest(req); setResolutionType('rejected'); setOverrideTarget(''); setResolutionNote(''); }}
                                 className="px-2 py-1 bg-[#BA1A1A] hover:bg-[#93000A] text-white font-bold rounded text-[10px] uppercase transition"
                               >
                                 Reject
@@ -1134,13 +1345,26 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                       <span>Escalated Leads Desk</span>
                     </h3>
                   </div>
-                  <div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex flex-col gap-1">
+                      <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Escalation Category</span>
+                      <select
+                        value={forwardedCategoryFilter}
+                        onChange={(e) => setForwardedCategoryFilter(e.target.value)}
+                        className="text-xs p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg font-semibold text-slate-700 focus:outline-none"
+                      >
+                        <option value="All">All Categories</option>
+                        {ESCALATION_CATEGORIES.map(c => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                    </div>
                     <input
                       type="text"
                       placeholder="Search candidate or counselor..."
                       value={forwardedSearchQuery}
                       onChange={(e) => setForwardedSearchQuery(e.target.value)}
-                      className="text-xs p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg w-64 focus:outline-none"
+                      className="text-xs p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg w-64 focus:outline-none self-end"
                     />
                   </div>
                 </div>
@@ -1150,6 +1374,7 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                 ) : (() => {
                   const q = forwardedSearchQuery.toLowerCase().trim();
                   const filtered = forwardedLeads.filter(lead => {
+                    if (forwardedCategoryFilter !== 'All' && lead.escalation_category !== forwardedCategoryFilter) return false;
                     if (!q) return true;
                     return (
                       (lead.name || '').toLowerCase().includes(q) ||
@@ -1169,15 +1394,27 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                           <tr className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">
                             <th className="p-3 pl-4">Candidate</th>
                             <th className="p-3">Phone</th>
+                            <th className="p-3">Email</th>
+                            <th className="p-3">Graduation</th>
                             <th className="p-3">Forwarded By</th>
-                            <th className="p-3">Stage</th>
+                            <th className="p-3">Status</th>
+                            <th className="p-3">Category</th>
                             <th className="p-3">Remark</th>
                             <th className="p-3">Date Escalated</th>
                             <th className="p-3 pr-4 text-center">Action</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#E2E8F0] font-body-sm text-[#111C2D]">
-                          {filtered.map(lead => (
+                          {filtered.map(lead => {
+                            const categoryColors = {
+                              'Finance Issue': { bg: '#FFF7ED', color: '#D97706', border: '#FDBA74' },
+                              'Time Constraint': { bg: '#EFF9FF', color: '#1BACE4', border: '#93D8F5' },
+                              'Decision Delay': { bg: '#F5F3FF', color: '#7C3AED', border: '#C4B5FD' },
+                              'Placement Concern': { bg: '#ECFDF5', color: '#059669', border: '#6EE7B7' },
+                              'Other': { bg: '#F8FAFC', color: '#505F76', border: '#CBD5E1' }
+                            };
+                            const cc = categoryColors[lead.escalation_category] || categoryColors['Other'];
+                            return (
                             <tr key={lead.id} className="hover:bg-slate-50/70 transition">
                               <td className="p-3 pl-4">
                                 <div className="font-semibold text-[#1BACE4]">{lead.name}</div>
@@ -1186,13 +1423,35 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                               <td className="p-3 text-slate-650 font-data-mono">
                                 <MaskedPhone phone={lead.phone} />
                               </td>
+                              <td className="p-3 text-slate-650 font-data-mono text-[10px]">
+                                <MaskedEmail email={lead.email} />
+                              </td>
+                              <td className="p-3 text-slate-700">{lead.graduation || '—'}</td>
                               <td className="p-3 font-semibold text-slate-700">{lead.counselor_name}</td>
                               <td className="p-3">
-                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#E6F8FE] text-[#1BACE4] border border-[#1BACE4]/20">
-                                  {lead.stage}
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(lead.counseling_status).badge}`}>
+                                  {lead.counseling_status || 'Not Contacted'}
                                 </span>
                               </td>
-                              <td className="p-3 max-w-[200px] truncate italic text-slate-600 font-normal" title={lead.forward_remark}>"{lead.forward_remark || 'No remarks'}"</td>
+                              <td className="p-3">
+                                {lead.escalation_category ? (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold border" style={{ background: cc.bg, color: cc.color, borderColor: cc.border }}>
+                                    {lead.escalation_category}
+                                  </span>
+                                ) : <span className="text-[10px] text-[#CBD5E1] italic">Unset</span>}
+                              </td>
+                              <td className="p-3 max-w-[200px]">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate italic text-slate-600 font-normal" title={lead.forward_remark}>"{lead.forward_remark || 'No remarks'}"</span>
+                                  <button
+                                    onClick={() => setRemarksModalLead(lead)}
+                                    className="shrink-0 text-slate-400 hover:text-[#1BACE4]"
+                                    title="View all remarks"
+                                  >
+                                    <span className="material-symbols-outlined text-sm">forum</span>
+                                  </button>
+                                </div>
+                              </td>
                               <td className="p-3 text-[10px] text-slate-500 font-data-mono">
                                 {lead.forwarded_at ? new Date(lead.forwarded_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}
                               </td>
@@ -1210,7 +1469,8 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                                 </button>
                               </td>
                             </tr>
-                          ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -1288,11 +1548,22 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
                               </td>
                               <td className="p-3 font-semibold text-slate-700">{lead.counselor_name}</td>
                               <td className="p-3">
-                                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-red-50 border border-red-200 text-red-700 uppercase">
-                                  {lead.drop_stage || 'Unknown'}
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${getStatusStyle(lead.drop_stage).badge}`}>
+                                  {lead.drop_stage || lead.final_status || 'Unknown'}
                                 </span>
                               </td>
-                              <td className="p-3 max-w-[200px] truncate italic text-slate-600 font-normal" title={lead.drop_remark}>"{lead.drop_remark || 'No remark'}"</td>
+                              <td className="p-3 max-w-[200px]">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate italic text-slate-600 font-normal" title={lead.drop_remark}>"{lead.drop_remark || 'No remark'}"</span>
+                                  <button
+                                    onClick={() => setRemarksModalLead(lead)}
+                                    className="shrink-0 text-slate-400 hover:text-[#1BACE4]"
+                                    title="View all remarks"
+                                  >
+                                    <span className="material-symbols-outlined text-sm">forum</span>
+                                  </button>
+                                </div>
+                              </td>
                               <td className="p-3 pr-4 text-[10px] text-slate-500 font-data-mono">
                                 {lead.closed_at ? new Date(lead.closed_at).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}
                               </td>
@@ -1372,6 +1643,10 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
         </div>
       )}
 
+      {remarksModalLead && (
+        <RemarksModal token={token} lead={remarksModalLead} onClose={() => setRemarksModalLead(null)} />
+      )}
+
       {/* RESOLUTION MODAL FOR ESCALATIONS */}
       {resolveModalLead && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40 p-4">
@@ -1384,7 +1659,8 @@ export default function TeamLeaderDashboard({ token, user, onLogout }) {
               
               <div className="text-xs space-y-1.5 bg-[#F8FAFC] p-3 rounded-lg border border-[#E2E8F0]">
                 <div><span className="font-bold text-slate-700">Forwarded By:</span> {resolveModalLead.counselor_name}</div>
-                <div><span className="font-bold text-slate-700">Original Stage:</span> {resolveModalLead.stage}</div>
+                <div><span className="font-bold text-slate-700">Current Status:</span> {resolveModalLead.counseling_status}</div>
+                <div><span className="font-bold text-slate-700">Category:</span> {resolveModalLead.escalation_category || 'Unset'}</div>
                 <div><span className="font-bold text-slate-700">Escalation Reason:</span> <span className="italic text-slate-655">"{resolveModalLead.forward_remark || 'None'}"</span></div>
               </div>
 

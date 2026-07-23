@@ -23,6 +23,7 @@ import SuperAdminDashboard from './views/SuperAdminDashboard';
 import ManagerDashboard from './views/ManagerDashboard';
 import CounselorDashboard from './views/CounselorDashboard';
 import TeamLeaderDashboard from './views/TeamLeaderDashboard';
+import HiringEntry from './modules/hiring/HiringEntry';
 
 // Optional absolute backend base URL for cross-origin setups; defaults to a relative
 // path so requests stay same-origin, matching every other fetch in this app - this
@@ -134,6 +135,9 @@ export default function App() {
       return <TeamLeaderDashboard token={token} user={user} onLogout={handleLogout} />;
     case 'counselor':
       return <CounselorDashboard token={token} user={user} onLogout={handleLogout} />;
+    case 'recruiter':
+    case 'hiring_team_leader':
+      return <HiringEntry token={token} user={user} onLogout={handleLogout} />;
     default:
       return <LoginView onLoginSuccess={handleLoginSuccess} />;
   }

@@ -17,19 +17,29 @@
  * ============================================================================
  */
 
+const dotenv = require('dotenv');
+dotenv.config();
+
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const xlsx = require('xlsx');
+const bcrypt = require('bcryptjs');
 const { randomUUID } = require('crypto');
 const db = require('./db');
 const { authenticateToken, requireRole, generateToken } = require('./auth');
-
-dotenv.config();
+const hiringRouter = require('./modules/hiring/routes');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Trust the single reverse proxy in front of us (nginx in production, cloudflared/localtunnel
+// for ad-hoc sharing) so req.ip and express-rate-limit read the real client IP from
+// X-Forwarded-For instead of throwing/misattributing every request to the proxy's own IP.
+app.set('trust proxy', 1);
 
 // Restrict CORS to an explicit allow-list. Origins are supplied via the
 // CORS_ORIGIN env var (comma-separated) and fall back to common localhost
@@ -52,7 +62,25 @@ app.use(cors({
   },
   credentials: true
 }));
+// This server only ever returns JSON, so helmet's default Content-Security-Policy (meant for
+// HTML documents) is switched off here — the CSP that actually matters lives in
+// frontend/index.html's <meta> tag, applied to the page the browser renders. What's still
+// useful on a JSON API: X-Content-Type-Options (blocks MIME-sniffing an API response into
+// executable content) and the rest of helmet's non-CSP hardening headers.
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
+
+// Login brute-force protection: 10 attempts per IP per 15 minutes. Deliberately not keyed by
+// email too — an attacker rotating emails against one password (credential stuffing) is still
+// throttled by IP, and keying by email as well would let an attacker lock out a known victim's
+// account by deliberately failing their login from elsewhere (a denial-of-service side door).
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' }
+});
 
 // Configure multer for file upload in memory with bounded size and Excel-only filter
 const upload = multer({
@@ -69,6 +97,13 @@ const upload = multer({
 
 // --- UTILITY FUNCTIONS ---
 
+// Helper to serialize Date objects for database queries (handles SQLite vs Postgres difference)
+function serializeDate(date) {
+  if (!date) return null;
+  const isSqlite = db.client.config.client === 'sqlite3';
+  return isSqlite ? (date instanceof Date ? date.getTime() : new Date(date).getTime()) : date;
+}
+
 // Helper to write activity log within a transaction
 async function logActivity(trx, leadId, counselorId, action, remark) {
   await trx('lead_activity_log').insert({
@@ -81,11 +116,287 @@ async function logActivity(trx, leadId, counselorId, action, remark) {
   });
 }
 
+// Fixed prefix used whenever a lead's flat counseling status changes (see
+// PUT /api/counselor/leads/:id/status below). Kept as a constant so reports can reliably
+// strip it back off to recover the status value from the log entry.
+const STATUS_LOG_PREFIX = 'Counseling status changed to: ';
+
+// The flat status model replacing the old L1/L2/L3 stage pipeline. 'Not Contacted' is
+// the default before a counselor has done anything with a freshly allocated lead.
+const COUNSELING_STATUSES = ['Not Contacted', 'Interested', 'Call Back', 'Cold', 'Not Interested', 'Not Contactable', 'Lead Punched', 'Duplicate Lead', 'Job Seeker'];
+const NOT_CONTACTABLE_REASONS = ['Switch Off', 'Out of Coverage', 'Not Picked', 'Call Fail', 'Wrong Number', 'Others'];
+// Statuses that immediately close out a lead (assignment deleted, closures row written).
+// 'Lead Punched' is ALSO terminal, but only once fee_payment_status becomes 'Full' —
+// that transition is handled separately since it depends on a second field, not just
+// counseling_status alone.
+const TERMINAL_STATUSES = ['Not Interested', 'Duplicate Lead', 'Job Seeker'];
+const FEE_PAYMENT_STATUSES = ['None', 'Partial', 'Full'];
+const REGISTRATION_STATUSES = ['Not Registered', 'Registered'];
+// Whether this contact is a fresh application ('Created') or already existed as a lead at
+// another university before ('Existed', with existed_university_id recording which one).
+const LEAD_TYPES = ['Created', 'Existed'];
+// Independent intent classification for Interested/Lead Punched/Duplicate Lead leads —
+// distinct from the 'Cold' counseling_status, which is about contact-ability, not intent.
+const LEAD_TEMPERATURES = ['Hot', 'Warm', 'Cold'];
+const DEFAULT_FEE_REMINDER_DAYS = 7;
+
+// Resolve a 'today' | 'week' | 'month' | 'all' shorthand into a concrete UTC date
+// range for report filtering. 'week' and 'month' are calendar-aligned (Monday start),
+// not a rolling window. Returns null for 'all' (or anything unrecognized), meaning
+// "no date filter".
+//
+// IST (the business's actual timezone) throughout, NOT UTC — a pure-UTC "today" is wrong
+// for up to 5.5 hours around every IST midnight (e.g. 2:00 AM IST is still "yesterday" in
+// UTC), which silently misbucketed touched-lead counts, daily tracking, and status-history
+// reports right around that window. See getCurrentMonthKeyIST below, which already
+// documented and fixed this exact class of bug for monthly targets — this generalizes the
+// same fix to every other "today"/"week"/"month"/custom-date-range report.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+// 'YYYY-MM-DD' for the IST calendar date of `date` (defaults to now).
+function getISTDateString(date = new Date()) {
+  return new Date(date.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+// Given an IST calendar date string 'YYYY-MM-DD', returns { start, end } as real UTC
+// instants marking IST 00:00:00.000 and 23:59:59.999 of that day — use this instead of
+// `new Date(`${dateStr}T00:00:00.000Z`)` for any user-facing date filter/boundary, since
+// the Z-suffixed form reads the string as UTC midnight rather than IST midnight.
+function getISTDayRange(dateStr) {
+  return {
+    start: new Date(`${dateStr}T00:00:00.000+05:30`),
+    end: new Date(`${dateStr}T23:59:59.999+05:30`)
+  };
+}
+
+function getPeriodRange(period) {
+  const todayStr = getISTDateString();
+  if (period === 'today') {
+    return getISTDayRange(todayStr);
+  }
+  if (period === 'week') {
+    const [y, m, d] = todayStr.split('-').map(Number);
+    const dayOfWeek = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0 = Sunday
+    const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const mondayStr = new Date(Date.UTC(y, m - 1, d - diffToMonday)).toISOString().slice(0, 10);
+    const sundayStr = new Date(Date.UTC(y, m - 1, d - diffToMonday + 6)).toISOString().slice(0, 10);
+    return { start: getISTDayRange(mondayStr).start, end: getISTDayRange(sundayStr).end };
+  }
+  if (period === 'month') {
+    const [y, m] = todayStr.split('-').map(Number);
+    const firstStr = `${y}-${String(m).padStart(2, '0')}-01`;
+    const lastStr = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); // day 0 of next month = last day of this one
+    return { start: getISTDayRange(firstStr).start, end: getISTDayRange(lastStr).end };
+  }
+  return null;
+}
+
+// 'YYYY-MM' for the current IST calendar month — used to bucket monthly counselor targets.
+// Deliberately IST (the business's actual timezone), NOT UTC like a naive
+// `new Date().toISOString().substring(0,7)` would read — see getPeriodRange above for the
+// same class of bug generalized across every other date-bounded report.
+function getCurrentMonthKeyIST() {
+  return new Date(Date.now() + IST_OFFSET_MS).toISOString().substring(0, 7);
+}
+
+// Reduce a lead's activity log into a Data Status (L1) breakdown, counting each lead
+// AT MOST ONCE — its most recent 'status_change' entry in the log window given. `logs` =
+// [{ lead_id, action, remark, timestamp }], any order, already filtered to the desired
+// reporting window by the caller.
+function computeStatusSummary(logs) {
+  const sorted = [...logs].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const latestPerLead = new Map(); // lead_id -> latest counseling_status in this window
+
+  sorted.forEach(log => {
+    if (!log.lead_id || log.action !== 'status_change') return;
+    if (!log.remark || !log.remark.startsWith(STATUS_LOG_PREFIX)) return;
+    // Strip the optional " (<reason>)" suffix (only ever appended for Not Contactable,
+    // see STATUS_LOG_PREFIX usage around notContactableReason) so the fixed-bucket match
+    // below recognizes it — otherwise "Not Contactable (Wrong Number)" never equals
+    // 'Not Contactable' and that bucket stays permanently at 0.
+    const status = log.remark.slice(STATUS_LOG_PREFIX.length).split(' — ')[0].trim().replace(/\s*\([^)]*\)$/, '');
+    latestPerLead.set(log.lead_id, status);
+  });
+
+  // 'Not Contacted' is a real, reachable value here too — a counselor can select it back
+  // in the Update Status dropdown (it's in COUNSELING_STATUSES like every other option),
+  // logging a genuine status_change entry. Without its own bucket, `total` (incremented
+  // unconditionally below) would silently exceed the sum of the named buckets whenever
+  // that happens.
+  const summary = { total: 0, not_contacted: 0, interested: 0, call_back: 0, cold: 0, not_interested: 0, not_contactable: 0, lead_punched: 0, duplicate_lead: 0, job_seeker: 0 };
+  latestPerLead.forEach(status => {
+    summary.total += 1;
+    if (status === 'Not Contacted') summary.not_contacted += 1;
+    else if (status === 'Interested') summary.interested += 1;
+    else if (status === 'Call Back') summary.call_back += 1;
+    else if (status === 'Cold') summary.cold += 1;
+    else if (status === 'Not Interested') summary.not_interested += 1;
+    else if (status === 'Not Contactable') summary.not_contactable += 1;
+    else if (status === 'Lead Punched') summary.lead_punched += 1;
+    else if (status === 'Duplicate Lead') summary.duplicate_lead += 1;
+    else if (status === 'Job Seeker') summary.job_seeker += 1;
+  });
+  return summary;
+}
+
+// Reconstruct each lead's counseling_status AS OF THE END OF EACH DAY it had activity, by
+// replaying its 'status_change' log entries chronologically. Used by the counselor
+// "work history by day" endpoints, which need to know what a lead's status actually was
+// on a past date rather than stamping every historical date with today's live status.
+// `logs` = [{ lead_id, action, remark, timestamp }], any order.
+// Returns { dateStr: { lead_id: counseling_status } }.
+function reconstructDailyStatusStates(logs) {
+  const sorted = [...logs].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const runningState = {}; // lead_id -> current counseling_status
+  const dateStateMap = {}; // dateStr -> { lead_id: status }
+
+  sorted.forEach(log => {
+    const leadId = log.lead_id;
+    if (!leadId) return;
+    if (!(leadId in runningState)) runningState[leadId] = 'Not Contacted';
+
+    if (log.action === 'status_change' && log.remark && log.remark.startsWith(STATUS_LOG_PREFIX)) {
+      runningState[leadId] = log.remark.slice(STATUS_LOG_PREFIX.length).split(' — ')[0].trim();
+    }
+
+    // IST calendar date, not UTC — a status change just after IST midnight (still "today"
+    // for the counselor) would otherwise land in yesterday's bucket, silently misattributing
+    // it to the wrong day in "work history by day".
+    const dateStr = getISTDateString(new Date(log.timestamp));
+    if (!dateStateMap[dateStr]) dateStateMap[dateStr] = {};
+    dateStateMap[dateStr][leadId] = runningState[leadId];
+  });
+
+  return dateStateMap;
+}
+
+// Compute the Fresh Allocation / Carry Forward / Touch% "Data Report" for one or more
+// counselors. Fresh Base / Opening CF are derived live from lead_assignments.assigned_at
+// (today vs earlier), and Touched Base from whether a lead has any lead_activity_log entry
+// today. Scope with EXACTLY ONE of `counselorIds` (explicit list, e.g. a single self-scoped
+// counselor) or `teamId` (team-scoped); omit both for a company-wide view.
+//
+// Also splits today's Carry Forward pool into "ahead" (status moved off Not Contacted —
+// including CF leads closed out entirely today) vs "pending" (still sitting untouched at
+// Not Contacted). CF leads that were closed today (enrolled/lost/duplicate/job_seeker) no
+// longer have a lead_assignments row to count — their assigned_at is recovered from
+// closures.assignment_assigned_at (see migration
+// 20260718120000_add_assignment_assigned_at_to_closures.js), snapshotted at the moment they
+// closed. Closures written before that migration have a null snapshot and are excluded from
+// the CF/Fresh split (counted only in cfOriginalTotal via the still-open leads).
+// Returns { perCounselor: [...], aggregate: {...} }.
+async function computeDataReport(dbOrTrx, { counselorIds, teamId } = {}) {
+  const todayRange = getPeriodRange('today');
+
+  let baseQuery = dbOrTrx('lead_assignments').join('users', 'lead_assignments.counselor_id', 'users.id');
+  if (counselorIds && counselorIds.length > 0) {
+    baseQuery = baseQuery.whereIn('lead_assignments.counselor_id', counselorIds);
+  } else if (teamId) {
+    baseQuery = baseQuery.where('users.team_id', teamId);
+  }
+
+  const rows = await baseQuery.select(
+    'lead_assignments.counselor_id',
+    'users.name as counselor_name',
+    'lead_assignments.lead_id',
+    'lead_assignments.assigned_at',
+    'lead_assignments.counseling_status'
+  );
+
+  const counselorMap = {};
+  const getOrCreate = (id, name) => {
+    if (!counselorMap[id]) {
+      counselorMap[id] = { id, name, openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0, cfAhead: 0, cfPending: 0, cfClosedToday: 0, leadIds: [] };
+    }
+    return counselorMap[id];
+  };
+
+  rows.forEach(r => {
+    const entry = getOrCreate(r.counselor_id, r.counselor_name);
+    entry.totalBase += 1;
+    entry.leadIds.push(r.lead_id);
+    const assignedAt = new Date(r.assigned_at);
+    const isFresh = assignedAt >= todayRange.start && assignedAt <= todayRange.end;
+    if (isFresh) {
+      entry.freshBase += 1;
+    } else {
+      entry.openingCF += 1;
+      if (r.counseling_status === 'Not Contacted') entry.cfPending += 1;
+      else entry.cfAhead += 1;
+    }
+  });
+
+  const allLeadIds = rows.map(r => r.lead_id);
+  let touchedLeadIds = new Set();
+  if (allLeadIds.length > 0) {
+    const touchLogs = await dbOrTrx('lead_activity_log')
+      .whereIn('lead_id', allLeadIds)
+      // Exclude 'distributed' — it's written automatically the moment a lead is allocated
+      // to a counselor (see /api/leads/distribute), not when the counselor actually does
+      // anything with it. Without this, every freshly-distributed lead counted as "touched"
+      // on day one regardless of whether the counselor had made a single call, inflating
+      // touchedBase/touchPct to look like leads were being worked when they hadn't been.
+      .whereNot('action', 'distributed')
+      .where('timestamp', '>=', serializeDate(todayRange.start))
+      .where('timestamp', '<=', serializeDate(todayRange.end))
+      .distinct('lead_id')
+      .select('lead_id');
+    touchedLeadIds = new Set(touchLogs.map(t => t.lead_id));
+  }
+
+  // CF leads closed out entirely today (enrolled/lost/duplicate/job_seeker) — their
+  // lead_assignments row is gone, so pull them from closures via the assigned_at snapshot.
+  let closedTodayQuery = dbOrTrx('closures')
+    .join('users', 'closures.counselor_id', 'users.id')
+    .where('closures.closed_at', '>=', serializeDate(todayRange.start))
+    .where('closures.closed_at', '<=', serializeDate(todayRange.end))
+    .where('closures.assignment_assigned_at', '<', serializeDate(todayRange.start))
+    .groupBy('closures.counselor_id', 'users.name')
+    .select('closures.counselor_id', 'users.name as counselor_name')
+    .count('closures.id as cnt');
+  if (counselorIds && counselorIds.length > 0) {
+    closedTodayQuery = closedTodayQuery.whereIn('closures.counselor_id', counselorIds);
+  } else if (teamId) {
+    closedTodayQuery = closedTodayQuery.where('users.team_id', teamId);
+  }
+  const closedTodayRows = await closedTodayQuery;
+  closedTodayRows.forEach(r => {
+    const entry = getOrCreate(r.counselor_id, r.counselor_name);
+    entry.cfClosedToday = parseInt(r.cnt, 10);
+  });
+
+  const perCounselor = Object.values(counselorMap).map(entry => {
+    const touchedBase = entry.leadIds.filter(id => touchedLeadIds.has(id)).length;
+    const touchPct = entry.totalBase > 0 ? Math.round((touchedBase / entry.totalBase) * 1000) / 10 : 0;
+    const cfOriginalTotal = entry.openingCF + entry.cfClosedToday;
+    return {
+      id: entry.id, name: entry.name, openingCF: entry.openingCF, freshBase: entry.freshBase,
+      totalBase: entry.totalBase, touchedBase, touchPct,
+      cfAhead: entry.cfAhead, cfPending: entry.cfPending, cfClosedToday: entry.cfClosedToday, cfOriginalTotal
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+
+  const aggregate = perCounselor.reduce((acc, c) => {
+    acc.openingCF += c.openingCF;
+    acc.freshBase += c.freshBase;
+    acc.totalBase += c.totalBase;
+    acc.touchedBase += c.touchedBase;
+    acc.cfAhead += c.cfAhead;
+    acc.cfPending += c.cfPending;
+    acc.cfClosedToday += c.cfClosedToday;
+    acc.cfOriginalTotal += c.cfOriginalTotal;
+    return acc;
+  }, { openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, cfAhead: 0, cfPending: 0, cfClosedToday: 0, cfOriginalTotal: 0 });
+  aggregate.touchPct = aggregate.totalBase > 0 ? Math.round((aggregate.touchedBase / aggregate.totalBase) * 1000) / 10 : 0;
+
+  return { perCounselor, aggregate };
+}
+
 // Clean phone format (keep only digits, check length, remove Excel decimal suffixes & scientific notation)
 function cleanPhone(phone) {
   if (!phone) return '';
   let str = String(phone).trim();
-  
+
   // Handle scientific notation (e.g. 9.87654e+09)
   if (str.toLowerCase().includes('e+')) {
     const num = Number(str);
@@ -93,7 +404,7 @@ function cleanPhone(phone) {
       str = String(num);
     }
   }
-  
+
   if (str.endsWith('.0')) {
     str = str.substring(0, str.length - 2);
   }
@@ -104,7 +415,27 @@ function cleanPhone(phone) {
 // Check email domain restriction
 function isValidDomain(email) {
   if (!email) return false;
-  return email.toLowerCase().endsWith('@company.com');
+  return email.toLowerCase().endsWith('@skilllabs.net');
+}
+
+// CSV/Excel formula-injection guard: a lead's name/company/source/etc. can originate from a
+// bulk-uploaded file or a counselor's free-text edit, so a cell value of "=CMD(...)" or
+// "@SUM(...)" would be interpreted as a live formula by Excel/Sheets when this row is later
+// exported and opened. Prefixing with a single quote forces spreadsheet apps to render it as
+// literal text instead of evaluating it. Applied to every row/column just before json_to_sheet.
+function sanitizeForExport(rows) {
+  return rows.map(row => {
+    const safeRow = {};
+    for (const key of Object.keys(row)) {
+      const value = row[key];
+      if (typeof value === 'string' && /^[=+\-@\t\r]/.test(value)) {
+        safeRow[key] = `'${value}`;
+      } else {
+        safeRow[key] = value;
+      }
+    }
+    return safeRow;
+  });
 }
 
 // Header aliases for auto-matching Excel headers to system fields
@@ -182,30 +513,46 @@ function parseExperience(val) {
 
 // --- AUTH API ENDPOINTS ---
 
-// Mock SSO Login endpoint
-app.post('/api/auth/login', async (req, res) => {
-  const { email, deviceId, force } = req.body;
+// Login endpoint — email + password authentication
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const { email, password, deviceId, force } = req.body;
 
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
+  // One generic message for "no such account" and "wrong password" — returning distinct
+  // errors let an attacker enumerate valid @skilllabs.net accounts before even guessing
+  // passwords against them.
+  const invalidCredentials = () => res.status(401).json({ error: 'Incorrect email or password.' });
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
   }
 
   if (!isValidDomain(email)) {
-    return res.status(400).json({ error: 'Access restricted: Only @company.com accounts are permitted.' });
+    return res.status(400).json({ error: 'Access restricted: Only @skilllabs.net accounts are permitted.' });
   }
 
   try {
-    const user = await db('users').where({ company_email: email }).first();
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await db('users').where({ company_email: normalizedEmail }).first();
 
     if (!user) {
-      return res.status(404).json({ error: 'User account not registered in system.' });
+      return invalidCredentials();
     }
 
     if (!user.active) {
       return res.status(403).json({ error: 'Your account is currently deactivated.' });
     }
 
+    if (!user.password_hash) {
+      return invalidCredentials();
+    }
+
+    const passwordMatches = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatches) {
+      return invalidCredentials();
+    }
+
     // Session conflict check
+    const isForcedTakeover = Boolean(user.device_id && user.device_id !== deviceId && force);
     if (user.device_id && user.device_id !== deviceId && !force) {
       return res.status(409).json({
         error: 'Active session detected on another device.',
@@ -219,18 +566,21 @@ app.post('/api/auth/login', async (req, res) => {
       updated_at: new Date()
     });
 
-    // Write login activity with user ID recorded
+    // Write login activity with user ID recorded — forced takeovers get a distinct remark
+    // so the audit trail shows when a previous session was kicked out, not just a plain login.
     await db('lead_activity_log').insert({
       id: randomUUID(),
       lead_id: null,
       counselor_id: user.id,
       action: 'login',
-      remark: `${user.name} (${user.role}) logged in — Device: ${deviceId}`,
+      remark: isForcedTakeover
+        ? `${user.name} (${user.role}) logged in — Device: ${deviceId} (forced termination of previous active session)`
+        : `${user.name} (${user.role}) logged in — Device: ${deviceId}`,
       timestamp: new Date()
     });
 
     const token = generateToken(user, deviceId);
-    
+
     return res.json({
       token,
       user: {
@@ -270,7 +620,8 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
 // Get profile
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
-    res.json({ user: req.user });
+    const { password_hash, ...safeUser } = req.user;
+    res.json({ user: safeUser });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to retrieve current user session profile' });
@@ -280,8 +631,10 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
 // Get team counselors
 app.get('/api/users/counselors', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
   try {
-    let query = db('users').where({ role: 'counselor', active: true });
-    
+    let query = db('users')
+      .where({ role: 'counselor', active: true })
+      .select('id', 'name', 'company_email', 'role', 'team_id', 'active', 'created_at', 'updated_at');
+
     // Team leaders only see counselors in their team
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
@@ -310,7 +663,7 @@ app.get('/api/users/counselors', authenticateToken, requireRole(['super_admin', 
     });
 
     // Include monthly targets
-    const currentMonth = new Date().toISOString().substring(0, 7);
+    const currentMonth = getCurrentMonthKeyIST();
     const targets = await db('targets')
       .whereIn('counselor_id', counselorIds)
       .andWhere({ target_month: currentMonth });
@@ -442,7 +795,11 @@ app.get('/api/admin/users', authenticateToken, requireRole(['super_admin']), asy
   try {
     const users = await db('users')
       .leftJoin('teams', 'users.team_id', 'teams.id')
-      .select('users.*', 'teams.name as team_name')
+      .select(
+        'users.id', 'users.name', 'users.company_email', 'users.role', 'users.team_id',
+        'users.hiring_team_id', 'users.device_id', 'users.active', 'users.created_at', 'users.updated_at',
+        'teams.name as team_name'
+      )
       .orderBy('users.created_at', 'desc');
     res.json(users);
   } catch (err) {
@@ -453,12 +810,15 @@ app.get('/api/admin/users', authenticateToken, requireRole(['super_admin']), asy
 
 // Create a new user (counselor, manager, team_leader, super_admin)
 app.post('/api/admin/users', authenticateToken, requireRole(['super_admin']), async (req, res) => {
-  const { name, email, role, teamId } = req.body;
-  if (!name || !email || !role) {
-    return res.status(400).json({ error: 'Name, company email, and role are required.' });
+  const { name, email, password, role, teamId } = req.body;
+  if (!name || !email || !password || !role) {
+    return res.status(400).json({ error: 'Name, company email, password, and role are required.' });
   }
   if (!isValidDomain(email)) {
-    return res.status(400).json({ error: 'Invalid email domain. Only @company.com is allowed.' });
+    return res.status(400).json({ error: 'Invalid email domain. Only @skilllabs.net is allowed.' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
   }
   try {
     const existing = await db('users').where({ company_email: email.trim().toLowerCase() }).first();
@@ -466,10 +826,12 @@ app.post('/api/admin/users', authenticateToken, requireRole(['super_admin']), as
       return res.status(400).json({ error: 'A user with this email already exists.' });
     }
     const newUserId = randomUUID();
+    const passwordHash = await bcrypt.hash(password, 10);
     await db('users').insert({
       id: newUserId,
       name: name.trim(),
       company_email: email.trim().toLowerCase(),
+      password_hash: passwordHash,
       role,
       team_id: teamId || null,
       active: true,
@@ -488,6 +850,79 @@ app.post('/api/admin/users', authenticateToken, requireRole(['super_admin']), as
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create user account' });
+  }
+});
+
+// Reset a user's password (admin-managed accounts, no self-service reset flow)
+app.put('/api/admin/users/:id/reset-password', authenticateToken, requireRole(['super_admin']), async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+  }
+  try {
+    const user = await db('users').where({ id }).first();
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    await db('users').where({ id }).update({
+      password_hash: passwordHash,
+      updated_at: new Date()
+    });
+
+    await db('lead_activity_log').insert({
+      id: randomUUID(),
+      action: 'note',
+      remark: `Password reset for user ${user.name}`,
+      timestamp: new Date()
+    });
+
+    res.json({ id, message: 'Password reset successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// Edit a user's name and/or company email
+app.put('/api/admin/users/:id', authenticateToken, requireRole(['super_admin']), async (req, res) => {
+  const { id } = req.params;
+  const { name, email } = req.body;
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Name and company email are required.' });
+  }
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!isValidDomain(normalizedEmail)) {
+    return res.status(400).json({ error: 'Invalid email domain. Only @skilllabs.net is allowed.' });
+  }
+  try {
+    const user = await db('users').where({ id }).first();
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const existing = await db('users').where({ company_email: normalizedEmail }).whereNot({ id }).first();
+    if (existing) {
+      return res.status(400).json({ error: 'A user with this email already exists.' });
+    }
+
+    await db('users').where({ id }).update({
+      name: name.trim(),
+      company_email: normalizedEmail,
+      updated_at: new Date()
+    });
+
+    await db('lead_activity_log').insert({
+      id: randomUUID(),
+      action: 'note',
+      remark: `Updated user ${user.name} -> name: ${name.trim()}, email: ${normalizedEmail}`,
+      timestamp: new Date()
+    });
+
+    res.json({ id, name: name.trim(), email: normalizedEmail });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update user account' });
   }
 });
 
@@ -608,7 +1043,7 @@ app.post('/api/leads/upload', authenticateToken, requireRole(['super_admin', 'ma
     const existingLeads = await db('leads')
       .where({ status: 'clean' })
       .select('phone', 'email');
-    
+
     const existingPhones = new Set(existingLeads.map(l => l.phone));
     const existingEmails = new Set(existingLeads.filter(l => l.email).map(l => l.email.toLowerCase()));
 
@@ -765,6 +1200,12 @@ app.post('/api/leads/upload', authenticateToken, requireRole(['super_admin', 'ma
       }
     });
 
+    // Completely blank rows (no cell has any value) are skipped above without landing in
+    // any of clean/duplicate/invalid, so rows.length can be larger than their sum whenever
+    // the sheet has blank rows — using it as "total" made total_rows disagree with
+    // clean_rows + duplicate_rows + invalid_rows on the Upload Trend / repository stats.
+    const totalProcessedRows = cleanLeads.length + duplicateLeads.length + invalidLeads.length;
+
     // Write in transaction
     await db.transaction(async (trx) => {
       // 1. Create upload batch record
@@ -773,7 +1214,7 @@ app.post('/api/leads/upload', authenticateToken, requireRole(['super_admin', 'ma
         uploaded_by: req.user.id,
         file_name: req.file.originalname,
         upload_date: new Date(),
-        total_rows: rows.length,
+        total_rows: totalProcessedRows,
         clean_rows: cleanLeads.length,
         duplicate_rows: duplicateLeads.length,
         invalid_rows: invalidLeads.length
@@ -781,7 +1222,7 @@ app.post('/api/leads/upload', authenticateToken, requireRole(['super_admin', 'ma
 
       // 2. Insert leads in batches
       const allLeads = [...cleanLeads, ...duplicateLeads, ...invalidLeads];
-      
+
       const chunkSize = 100;
       for (let i = 0; i < allLeads.length; i += chunkSize) {
         await trx('leads').insert(allLeads.slice(i, i + chunkSize));
@@ -793,7 +1234,7 @@ app.post('/api/leads/upload', authenticateToken, requireRole(['super_admin', 'ma
 
     res.json({
       batchId,
-      total: rows.length,
+      total: totalProcessedRows,
       clean: cleanLeads.length,
       duplicate: duplicateLeads.length,
       invalid: invalidLeads.length,
@@ -828,9 +1269,14 @@ app.get('/api/leads/export/batch/:batchId', authenticateToken, requireRole(['sup
       timestamp: new Date()
     });
 
+    // Assigned Counselor falls back to closures.counselor_id — dropping a lead deletes
+    // its lead_assignments row, so relying on that join alone leaves every dropped lead's
+    // "Assigned Counselor" blank in the exported file even though we know who worked it.
     const leads = await db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('users', 'lead_assignments.counselor_id', 'users.id')
+      .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
       .select(
         'leads.name as Candidate Name',
@@ -845,8 +1291,8 @@ app.get('/api/leads/export/batch/:batchId', authenticateToken, requireRole(['sup
         'leads.course_interest as Course Interest',
         'universities.name as Interested University',
         'leads.source as Lead Source',
-        'users.name as Assigned Counselor',
-        'lead_assignments.stage as Pipeline Stage',
+        db.raw('COALESCE(users.name, closure_counselors.name) as "Assigned Counselor"'),
+        'lead_assignments.counseling_status as Counseling Status',
         'leads.status as Data Status',
         'leads.created_at as Upload Date'
       )
@@ -854,7 +1300,7 @@ app.get('/api/leads/export/batch/:batchId', authenticateToken, requireRole(['sup
       .orderBy('leads.created_at', 'asc');
 
     const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.json_to_sheet(leads);
+    const ws = xlsx.utils.json_to_sheet(sanitizeForExport(leads));
     xlsx.utils.book_append_sheet(wb, ws, "Leads");
     const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
@@ -880,9 +1326,14 @@ app.get('/api/leads/export/all', authenticateToken, requireRole(['super_admin', 
       remark: `Downloaded full leads export (all data)`,
       timestamp: new Date()
     });
+    // Assigned Counselor falls back to closures.counselor_id — dropping a lead deletes
+    // its lead_assignments row, so relying on that join alone leaves every dropped lead's
+    // "Assigned Counselor" blank in the exported file even though we know who worked it.
     const leads = await db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('users', 'lead_assignments.counselor_id', 'users.id')
+      .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
       .select(
         'leads.name as Candidate Name',
@@ -897,15 +1348,15 @@ app.get('/api/leads/export/all', authenticateToken, requireRole(['super_admin', 
         'leads.course_interest as Course Interest',
         'universities.name as Interested University',
         'leads.source as Lead Source',
-        'users.name as Assigned Counselor',
-        'lead_assignments.stage as Pipeline Stage',
+        db.raw('COALESCE(users.name, closure_counselors.name) as "Assigned Counselor"'),
+        'lead_assignments.counseling_status as Counseling Status',
         'leads.status as Data Status',
         'leads.created_at as Upload Date'
       )
       .orderBy('leads.created_at', 'asc');
 
     const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.json_to_sheet(leads);
+    const ws = xlsx.utils.json_to_sheet(sanitizeForExport(leads));
     xlsx.utils.book_append_sheet(wb, ws, "All Leads");
     const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
@@ -935,9 +1386,9 @@ app.get('/api/leads/pool', authenticateToken, requireRole(['super_admin', 'manag
 
     if (location) {
       const locLower = String(location).toLowerCase();
-      query = query.where(function() {
+      query = query.where(function () {
         this.where(db.raw('LOWER(leads.city)'), 'like', `%${locLower}%`)
-            .orWhere(db.raw('LOWER(leads.state)'), 'like', `%${locLower}%`);
+          .orWhere(db.raw('LOWER(leads.state)'), 'like', `%${locLower}%`);
       });
     }
 
@@ -976,11 +1427,11 @@ app.get('/api/leads/pool', authenticateToken, requireRole(['super_admin', 'manag
     }
 
     if (start_date) {
-      query = query.where('leads.created_at', '>=', new Date(start_date));
+      query = query.where('leads.created_at', '>=', serializeDate(new Date(start_date)));
     }
 
     if (end_date) {
-      query = query.where('leads.created_at', '<=', new Date(end_date));
+      query = query.where('leads.created_at', '<=', serializeDate(new Date(end_date)));
     }
 
     const pool = await query.orderBy('leads.created_at', 'asc');
@@ -1047,16 +1498,58 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
   try {
     await db.transaction(async (trx) => {
       // 1. Fetch available leads matching the criteria
-      // Re-apply same pool logic inside transaction to prevent race conditions
+      // Re-apply the SAME pool filters as GET /api/leads/pool, inside the transaction (both
+      // to prevent race conditions AND because the manager's on-screen "N leads available"
+      // count and preview came from that filtered pool — without re-applying city/state/
+      // source/interest/experience/date/university here too, this pulled from the ENTIRE
+      // clean/unassigned pool regardless of what was actually filtered on screen, silently
+      // handing counselors leads outside the criteria the manager thought they'd scoped to.
+      const { location, city, state, source, interest, start_date, end_date, min_exp, max_exp, university_id } = filterCriteria || {};
+
       let query = trx('leads')
         .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
         .where({ 'leads.status': 'clean' })
         .whereNull('lead_assignments.id')
-        .select('leads.id')
+        .select('leads.id', 'leads.experience')
         .forUpdate(); // Lock leads rows during transaction!
 
       if (sourceBatchId) {
         query = query.where({ 'leads.upload_batch_id': sourceBatchId });
+      }
+
+      if (location) {
+        const locLower = String(location).toLowerCase();
+        query = query.where(function () {
+          this.where(trx.raw('LOWER(leads.city)'), 'like', `%${locLower}%`)
+            .orWhere(trx.raw('LOWER(leads.state)'), 'like', `%${locLower}%`);
+        });
+      }
+      if (city) {
+        query = query.where(trx.raw('LOWER(leads.city)'), '=', city.toLowerCase());
+      }
+      if (state) {
+        query = query.where(trx.raw('LOWER(leads.state)'), '=', state.toLowerCase());
+      }
+      if (source) {
+        query = query.where(trx.raw('LOWER(leads.source)'), 'like', `%${String(source).toLowerCase()}%`);
+      }
+      if (interest) {
+        query = query.where(trx.raw('LOWER(leads.course_interest)'), 'like', `%${String(interest).toLowerCase()}%`);
+      }
+      if (university_id) {
+        query = query.where({ 'leads.university_id': university_id });
+      }
+      if (min_exp) {
+        query = query.where('leads.experience', '>=', parseFloat(min_exp));
+      }
+      if (max_exp) {
+        query = query.where('leads.experience', '<=', parseFloat(max_exp));
+      }
+      if (start_date) {
+        query = query.where('leads.created_at', '>=', serializeDate(new Date(start_date)));
+      }
+      if (end_date) {
+        query = query.where('leads.created_at', '<=', serializeDate(new Date(end_date)));
       }
 
       const availableLeads = await query.orderBy('leads.created_at', 'asc');
@@ -1064,6 +1557,16 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
       if (availableLeads.length < totalRequested) {
         throw new Error(`Insufficient leads in the pool. Requested: ${totalRequested}, Available: ${availableLeads.length}`);
       }
+
+      // Split the pool into freshers (no experience) and experienced candidates so that
+      // every counselor gets a proportional mix of both — instead of whichever leads
+      // happen to fall next in upload order. Each list stays FIFO (oldest lead first)
+      // within its own category.
+      const fresherPool = availableLeads.filter(l => !l.experience || l.experience <= 0);
+      const experiencedPool = availableLeads.filter(l => l.experience > 0);
+      let fPtr = 0, ePtr = 0;
+      let fRemaining = fresherPool.length;
+      let eRemaining = experiencedPool.length;
 
       // Create distribution batch
       const distBatchId = randomUUID();
@@ -1077,8 +1580,6 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
         status: 'confirmed'
       });
 
-      let leadPointer = 0;
-
       for (const alloc of allocations) {
         const count = parseInt(alloc.count, 10);
         if (count <= 0) continue;
@@ -1089,9 +1590,32 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
           throw new Error(`Counselor ${alloc.counselorId} is not active or invalid.`);
         }
 
+        // Proportional split based on the CURRENT remaining mix, so the ratio of
+        // freshers to experienced stays consistent across every counselor's share —
+        // e.g. a 60/40 fresher/experienced pool gives every counselor a ~60/40 batch,
+        // rather than whichever counselor happens to be allocated first draining one
+        // category dry and leaving the rest all-fresher or all-experienced.
+        const totalRemaining = fRemaining + eRemaining;
+        let fShare = totalRemaining > 0 ? Math.round(count * fRemaining / totalRemaining) : 0;
+        fShare = Math.min(fShare, fRemaining, count);
+        let eShare = count - fShare;
+        if (eShare > eRemaining) {
+          const shortfall = eShare - eRemaining;
+          eShare = eRemaining;
+          fShare += shortfall;
+        }
+
+        const batchLeads = [
+          ...fresherPool.slice(fPtr, fPtr + fShare),
+          ...experiencedPool.slice(ePtr, ePtr + eShare)
+        ];
+        fPtr += fShare;
+        fRemaining -= fShare;
+        ePtr += eShare;
+        eRemaining -= eShare;
+
         const allocatedIds = [];
-        for (let j = 0; j < count; j++) {
-          const lead = availableLeads[leadPointer++];
+        for (const lead of batchLeads) {
           allocatedIds.push(lead.id);
 
           // Assign lead
@@ -1102,6 +1626,7 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
             assigned_by: req.user.id,
             assigned_at: new Date(),
             stage: 'L1',
+            counseling_status: 'Not Contacted',
             locked: true,
             updated_at: new Date()
           });
@@ -1135,41 +1660,66 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
 
 // Get counselor leads
 app.get('/api/counselor/leads', authenticateToken, requireRole(['counselor']), async (req, res) => {
-  const { stage, is_due_followup } = req.query;
+  const { counselingStatus, is_due_followup } = req.query;
 
   try {
+    // Each lead's next still-open follow-up date (if any), so the frontend can derive
+    // "due today" / "Call Back" scheduling client-side from this one payload instead of
+    // needing a second, separately-filtered request just for the Follow-ups tab.
+    const followUpSubquery = db('follow_ups')
+      .where({ counselor_id: req.user.id, completed: false })
+      .groupBy('lead_id')
+      .select('lead_id')
+      .max('follow_up_date as next_follow_up_date')
+      .as('fu');
+
     let query = db('leads')
       .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
+      .leftJoin('universities as existed_universities', 'leads.existed_university_id', 'existed_universities.id')
       .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin(followUpSubquery, 'leads.id', 'fu.lead_id')
       .where({ 'lead_assignments.counselor_id': req.user.id })
       .select(
         'leads.*',
-        'lead_assignments.stage',
+        'existed_universities.name as existed_university_name',
         'lead_assignments.locked',
         'lead_assignments.assigned_at',
-        'lead_assignments.disposition as disposition',
+        'lead_assignments.counseling_status',
+        'lead_assignments.not_contactable_reason',
+        'lead_assignments.status_remark',
+        'lead_assignments.registration_status',
+        'lead_assignments.registration_date',
+        'lead_assignments.fee_payment_status',
+        'lead_assignments.fee_amount_paid',
+        'lead_assignments.fee_total_amount',
+        'lead_assignments.fee_reminder_due_at',
+        'lead_assignments.fee_reminder_note',
+        'lead_assignments.fee_reminder_acknowledged',
+        'lead_assignments.is_forwarded',
+        'lead_assignments.forward_remark',
+        'lead_assignments.forwarded_at',
+        'lead_assignments.escalation_category',
         'universities.name as university_name',
         'closures.documents_status as documents_status',
         'closures.application_status as application_status',
-        'closures.revenue as closure_revenue'
+        'closures.revenue as closure_revenue',
+        'fu.next_follow_up_date'
       );
 
-    if (stage) {
-      query = query.where({ 'lead_assignments.stage': stage });
+    if (counselingStatus) {
+      query = query.where({ 'lead_assignments.counseling_status': counselingStatus });
     }
 
     let leads = await query.orderBy('leads.created_at', 'desc');
 
-    // Filter followups
+    // Optional server-side narrowing, kept for backward compatibility — the dashboard
+    // itself now derives the Follow-ups Due view client-side from next_follow_up_date
+    // instead of requesting this separately, so the full base and the due-list are
+    // always counted from the exact same fetch.
     if (is_due_followup === 'true') {
       const now = new Date();
-      const followUps = await db('follow_ups')
-        .where({ counselor_id: req.user.id, completed: false })
-        .where('follow_up_date', '<=', now);
-      
-      const dueLeadIds = new Set(followUps.map(f => f.lead_id));
-      leads = leads.filter(l => dueLeadIds.has(l.id));
+      leads = leads.filter(l => l.next_follow_up_date && new Date(l.next_follow_up_date) <= now);
     }
 
     res.json(leads);
@@ -1179,20 +1729,87 @@ app.get('/api/counselor/leads', authenticateToken, requireRole(['counselor']), a
   }
 });
 
+// Leads that came back from an escalation the counselor raised — either sent back by the
+// manager/team leader, or reassigned to this counselor as part of resolving someone else's
+// escalation — that the counselor hasn't acted on since. escalation_resolved_at is set the
+// moment a manager resolves an escalation (see /api/manager/leads/:id/resolve-forward) and
+// cleared the moment the counselor updates the lead's status again, so this list is
+// self-clearing: it only ever shows leads genuinely waiting on the counselor right now.
+app.get('/api/counselor/leads/escalation-returns', authenticateToken, requireRole(['counselor']), async (req, res) => {
+  try {
+    const leads = await db('leads')
+      .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
+      .leftJoin('universities', 'leads.university_id', 'universities.id')
+      .where({ 'lead_assignments.counselor_id': req.user.id })
+      .whereNotNull('lead_assignments.escalation_resolved_at')
+      .select(
+        'leads.*',
+        'lead_assignments.locked',
+        'lead_assignments.assigned_at',
+        'lead_assignments.counseling_status',
+        'lead_assignments.not_contactable_reason',
+        'lead_assignments.status_remark',
+        'lead_assignments.registration_status',
+        'lead_assignments.fee_payment_status',
+        'lead_assignments.fee_amount_paid',
+        'lead_assignments.fee_total_amount',
+        'lead_assignments.fee_reminder_due_at',
+        'lead_assignments.escalation_category',
+        'lead_assignments.escalation_resolved_at',
+        'lead_assignments.escalation_resolution_type',
+        'lead_assignments.escalation_resolution_note',
+        'universities.name as university_name'
+      )
+      .orderBy('lead_assignments.escalation_resolved_at', 'desc');
+
+    res.json(leads);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch escalation returns' });
+  }
+});
+
+// Lightweight due-follow-ups count for the always-visible sidebar badge. Deliberately a
+// single COUNT query against follow_ups rather than routing through /api/counselor/leads —
+// that endpoint joins leads/universities/closures for the whole active base, which is a lot
+// of data to pull across the wire just to read a number off the end of it.
+// Joined against lead_assignments so a follow-up left incomplete on a lead that has since
+// been closed out (enrolled/dropped) doesn't keep inflating the count — the closure path
+// now completes those going forward, but this guards against any that slip through. The
+// join also requires lead_assignments.counselor_id to match — a transfer/reassignment
+// carries the follow-up's counselor_id forward to the new owner, but this stays as a
+// second guard against ever counting a lead for a counselor who no longer owns it.
+app.get('/api/counselor/followups/count', authenticateToken, requireRole(['counselor']), async (req, res) => {
+  try {
+    const row = await db('follow_ups')
+      .join('lead_assignments', function () {
+        this.on('follow_ups.lead_id', '=', 'lead_assignments.lead_id')
+          .andOn('follow_ups.counselor_id', '=', 'lead_assignments.counselor_id');
+      })
+      .where({ 'follow_ups.counselor_id': req.user.id, 'follow_ups.completed': false })
+      .where('follow_ups.follow_up_date', '<=', serializeDate(new Date()))
+      .count('follow_ups.id as count')
+      .first();
+    res.json({ count: parseInt(row.count || 0, 10) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch due follow-ups count' });
+  }
+});
+
 // Get counselor's dropped leads
 app.get('/api/counselor/leads/dropped', authenticateToken, requireRole(['counselor']), async (req, res) => {
   try {
     const droppedLeads = await db('leads')
       .join('closures', 'leads.id', 'closures.lead_id')
       .leftJoin('universities', 'closures.university_id', 'universities.id')
-      .where({ 
-        'closures.counselor_id': req.user.id,
-        'closures.final_status': 'lost'
-      })
+      .where({ 'closures.counselor_id': req.user.id })
+      .whereIn('closures.final_status', ['lost', 'duplicate'])
       .select(
         'leads.*',
         'closures.drop_stage',
         'closures.drop_remark',
+        'closures.final_status',
         'closures.closed_at',
         'universities.name as university_name'
       )
@@ -1205,13 +1822,40 @@ app.get('/api/counselor/leads/dropped', authenticateToken, requireRole(['counsel
   }
 });
 
+// Get counselor's job seeker leads
+app.get('/api/counselor/leads/job-seekers', authenticateToken, requireRole(['counselor']), async (req, res) => {
+  try {
+    const jobSeekerLeads = await db('leads')
+      .join('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('universities', 'closures.university_id', 'universities.id')
+      .where({
+        'closures.counselor_id': req.user.id,
+        'closures.final_status': 'job_seeker'
+      })
+      .select(
+        'leads.*',
+        'closures.drop_stage',
+        'closures.drop_remark',
+        'closures.final_status',
+        'closures.closed_at',
+        'universities.name as university_name'
+      )
+      .orderBy('closures.closed_at', 'desc');
+
+    res.json(jobSeekerLeads);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch job seeker leads' });
+  }
+});
+
 // Get counselor's enrolled leads
 app.get('/api/counselor/leads/enrolled', authenticateToken, requireRole(['counselor']), async (req, res) => {
   try {
     const enrolledLeads = await db('leads')
       .join('closures', 'leads.id', 'closures.lead_id')
       .leftJoin('universities', 'closures.university_id', 'universities.id')
-      .where({ 
+      .where({
         'closures.counselor_id': req.user.id,
         'closures.final_status': 'enrolled'
       })
@@ -1231,296 +1875,316 @@ app.get('/api/counselor/leads/enrolled', authenticateToken, requireRole(['counse
   }
 });
 
-// Update Call Quality / Disposition Status
-app.put('/api/counselor/leads/:id/disposition', authenticateToken, requireRole(['counselor']), async (req, res) => {
+// Add a free-text remark with no status implication (replaces the old 'remark' outcome
+// branch of the removed /action endpoint).
+app.post('/api/counselor/leads/:id/note', authenticateToken, requireRole(['counselor']), async (req, res) => {
   const leadId = req.params.id;
-  const { disposition } = req.body;
+  const { remark } = req.body;
 
-  const validDispositions = ['None', 'Interested', 'Not Interested', 'Not Picked Up', 'Switched Off'];
-  if (!disposition || !validDispositions.includes(disposition)) {
-    return res.status(400).json({ error: 'Invalid quality status value' });
+  if (!remark || !remark.trim()) {
+    return res.status(400).json({ error: 'A remark is required.' });
   }
 
   try {
-    const affected = await db('lead_assignments')
-      .where({ lead_id: leadId, counselor_id: req.user.id })
-      .update({ disposition, updated_at: new Date() });
-
-    if (!affected) {
-      return res.status(404).json({ error: 'Lead assignment not found or access denied.' });
+    const assignment = await db('lead_assignments').where({ lead_id: leadId, counselor_id: req.user.id }).first();
+    if (!assignment) {
+      return res.status(404).json({ error: 'Access denied: You are not the owner of this lead.' });
     }
-
-    // Log status change in compliance log
-    await db('lead_activity_log').insert({
-      id: randomUUID(),
-      lead_id: leadId,
-      counselor_id: req.user.id,
-      action: 'status_change',
-      remark: `Call quality status changed to: ${disposition}`,
-      timestamp: new Date()
+    // Same fix as the Log Call and status-change paths: a note is real activity on this
+    // lead, so it should bump the "Last Updated" column on the Manager/Team Leader Daily
+    // Tracker the same way those do — otherwise a lead only ever touched via a plain note
+    // keeps showing whenever its status was last changed, ignoring the note entirely.
+    // Wrapped in a transaction so the assignment bump and the activity-log entry either
+    // both land or neither does — previously these were two independent statements, and an
+    // error between them (or a mid-flight crash) could bump updated_at with no matching log
+    // entry, or vice versa.
+    await db.transaction(async (trx) => {
+      await trx('lead_assignments').where({ lead_id: leadId }).update({ updated_at: new Date() });
+      await logActivity(trx, leadId, req.user.id, 'note', remark);
     });
-
-    res.json({ message: 'Quality status updated successfully.' });
+    res.json({ message: 'Remark added successfully.' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to update quality status' });
+    res.status(400).json({ error: err.message || 'Failed to add remark' });
   }
 });
 
-// Inline lead action (tick/cross/remark)
-app.post('/api/counselor/leads/:id/action', authenticateToken, requireRole(['counselor']), async (req, res) => {
+// Update a lead's flat counseling status — replaces the old disposition PUT and the
+// tick/cross outcomes of the old /action endpoint (the whole L1/L2/L3 pipeline).
+app.put('/api/counselor/leads/:id/status', authenticateToken, requireRole(['counselor']), async (req, res) => {
   const leadId = req.params.id;
-  const { 
-    outcome, 
-    remark, 
-    followUpDate, 
-    universityId, 
-    revenue, 
-    docChecklist, 
-    isWorkingPref, 
-    budget, 
-    isEligible, 
-    reason,
-    applicationStatus,
-    courseDiscussed
+  const {
+    counselingStatus,
+    notContactableReason,
+    remark,
+    universityId,
+    courseDiscussed,
+    leadType,
+    existedUniversityId,
+    leadTemperature,
+    registrationStatus,
+    registrationDate,
+    feePaymentStatus,
+    feeAmountPaid,
+    feeTotalAmount,
+    feeReminderDueAt,
+    feeReminderNote,
+    followUpDate
   } = req.body;
+
+  if (!counselingStatus || !COUNSELING_STATUSES.includes(counselingStatus)) {
+    return res.status(400).json({ error: `counselingStatus must be one of: ${COUNSELING_STATUSES.join(', ')}` });
+  }
+
+  if (counselingStatus === 'Call Back' && !followUpDate) {
+    return res.status(400).json({ error: 'followUpDate is required for Call Back.' });
+  }
+
+  // A remark is mandatory on every status change — it's the only durable record of what
+  // actually happened on the call, since the live counseling_status column just holds
+  // the latest value and terminal updates delete the lead_assignments row entirely.
+  if (!remark || !remark.trim()) {
+    return res.status(400).json({ error: 'A remark is required to update the status.' });
+  }
+
+  if (counselingStatus === 'Not Contactable') {
+    if (!notContactableReason || !NOT_CONTACTABLE_REASONS.includes(notContactableReason)) {
+      return res.status(400).json({ error: `notContactableReason is required and must be one of: ${NOT_CONTACTABLE_REASONS.join(', ')}` });
+    }
+  }
+
+  if ((counselingStatus === 'Lead Punched' || counselingStatus === 'Duplicate Lead') && !universityId) {
+    return res.status(400).json({ error: 'universityId is required for Lead Punched / Duplicate Lead.' });
+  }
+
+  if (leadType !== undefined && leadType !== null && leadType !== '' && !LEAD_TYPES.includes(leadType)) {
+    return res.status(400).json({ error: `leadType must be one of: ${LEAD_TYPES.join(', ')}` });
+  }
+
+  if (leadType === 'Existed' && !existedUniversityId) {
+    return res.status(400).json({ error: 'existedUniversityId is required when leadType is Existed.' });
+  }
+
+  if (leadTemperature !== undefined && leadTemperature !== null && leadTemperature !== '' && !LEAD_TEMPERATURES.includes(leadTemperature)) {
+    return res.status(400).json({ error: `leadTemperature must be one of: ${LEAD_TEMPERATURES.join(', ')}` });
+  }
+
+  if (counselingStatus === 'Lead Punched' && feePaymentStatus && !FEE_PAYMENT_STATUSES.includes(feePaymentStatus)) {
+    return res.status(400).json({ error: `feePaymentStatus must be one of: ${FEE_PAYMENT_STATUSES.join(', ')}` });
+  }
+
+  if (counselingStatus === 'Lead Punched' && registrationStatus && !REGISTRATION_STATUSES.includes(registrationStatus)) {
+    return res.status(400).json({ error: `registrationStatus must be one of: ${REGISTRATION_STATUSES.join(', ')}` });
+  }
 
   try {
     await db.transaction(async (trx) => {
-      // 1. Verify owner and lock state
       const assignment = await trx('lead_assignments').where({ lead_id: leadId, counselor_id: req.user.id }).first();
       if (!assignment) {
         throw new Error('Access denied: You are not the owner of this lead.');
       }
-
       if (!assignment.locked) {
         throw new Error('This lead is not currently locked for counseling.');
       }
+      // Block status changes while a lead is escalated to the manager — dropping/closing
+      // a still-escalated lead would delete its lead_assignments row (where is_forwarded/
+      // forward_remark/escalation_category live), permanently erasing the escalation with
+      // no trace it ever happened and silently disappearing it from the manager's queue.
+      if (assignment.is_forwarded) {
+        throw new Error('This lead is escalated and awaiting manager review. It cannot be updated until the manager resolves the escalation.');
+      }
 
-      const currentStage = assignment.stage;
-
-      // Update interested university if provided
-      if (universityId) {
+      if (universityId !== undefined) {
+        await trx('leads').where({ id: leadId }).update({ university_id: universityId || null, updated_at: new Date() });
+      }
+      if (courseDiscussed !== undefined) {
+        await trx('leads').where({ id: leadId }).update({ course_interest: courseDiscussed || null, updated_at: new Date() });
+      }
+      if (leadType !== undefined) {
         await trx('leads').where({ id: leadId }).update({
-          university_id: universityId,
+          lead_type: leadType || null,
+          existed_university_id: leadType === 'Existed' ? (existedUniversityId || null) : null,
           updated_at: new Date()
         });
       }
-
-      // Update course interest if provided
-      if (courseDiscussed) {
-        await trx('leads').where({ id: leadId }).update({
-          course_interest: courseDiscussed,
-          updated_at: new Date()
-        });
+      if (leadTemperature !== undefined) {
+        await trx('leads').where({ id: leadId }).update({ lead_temperature: leadTemperature || null, updated_at: new Date() });
       }
 
-      if (outcome === 'remark') {
-        // Just log remark
-        await logActivity(trx, leadId, req.user.id, 'note', remark || 'Added remark');
-      } 
-      else if (outcome === 'cross') {
-        // Close/Lost Lead with drop reason
-        const dropReason = reason || 'Not interested';
-        let leadStatus = 'closed';
-        if (dropReason.toLowerCase().includes('duplicate')) {
-          leadStatus = 'duplicate';
-        } else if (dropReason.toLowerCase().includes('ineligible') || dropReason.toLowerCase().includes('wrong number')) {
-          leadStatus = 'invalid';
-        }
+      const isTerminal = TERMINAL_STATUSES.includes(counselingStatus)
+        || (counselingStatus === 'Lead Punched' && feePaymentStatus === 'Full');
 
-        // Update lead status
-        await trx('leads').where({ id: leadId }).update({
-          status: leadStatus,
+      if (!isTerminal) {
+        // Non-terminal: update in place, stays in the active pool (tomorrow's Carry
+        // Forward if left untouched again).
+        const updates = {
+          counseling_status: counselingStatus,
+          not_contactable_reason: counselingStatus === 'Not Contactable' ? notContactableReason : null,
+          status_remark: remark || null,
+          // Acting on the lead resolves whatever prompted it to show under "Escalation
+          // Returns" — clear the flag so it drops off that list once handled. (Terminal
+          // statuses don't need this: they delete the lead_assignments row entirely.)
+          escalation_resolved_at: null,
           updated_at: new Date()
-        });
+        };
 
-        // Upsert closure record
-        const existingClosure = await trx('closures').where({ lead_id: leadId }).first();
-        if (existingClosure) {
-          await trx('closures').where({ lead_id: leadId }).update({
-            university_id: universityId || null,
-            application_status: 'rejected',
-            final_status: 'lost',
-            revenue: 0.00,
-            counselor_id: req.user.id,
-            drop_stage: currentStage,
-            drop_remark: remark || null,
-            closed_at: new Date()
-          });
-        } else {
-          await trx('closures').insert({
-            id: randomUUID(),
-            lead_id: leadId,
-            university_id: universityId || null,
-            documents_status: JSON.stringify({}),
-            application_status: 'rejected',
-            final_status: 'lost',
-            revenue: 0.00,
-            counselor_id: req.user.id,
-            drop_stage: currentStage,
-            drop_remark: remark || null,
-            created_at: new Date(),
-            closed_at: new Date()
-          });
+        if (counselingStatus === 'Lead Punched') {
+          updates.registration_status = registrationStatus || assignment.registration_status || 'Not Registered';
+          updates.registration_date = registrationStatus === 'Registered'
+            ? (registrationDate ? new Date(registrationDate) : (assignment.registration_date || new Date()))
+            : null;
+          updates.fee_payment_status = feePaymentStatus || assignment.fee_payment_status || 'None';
+          updates.fee_amount_paid = feeAmountPaid !== undefined ? parseFloat(feeAmountPaid || 0) : assignment.fee_amount_paid;
+          updates.fee_total_amount = feeTotalAmount !== undefined ? parseFloat(feeTotalAmount || 0) : assignment.fee_total_amount;
+          updates.fee_reminder_note = feeReminderNote !== undefined ? feeReminderNote : assignment.fee_reminder_note;
+          if (updates.fee_payment_status === 'Partial' || updates.fee_payment_status === 'Full') {
+            if (feeReminderDueAt) {
+              updates.fee_reminder_due_at = new Date(feeReminderDueAt);
+            } else if (!assignment.fee_reminder_due_at) {
+              const due = new Date();
+              due.setDate(due.getDate() + DEFAULT_FEE_REMINDER_DAYS);
+              updates.fee_reminder_due_at = due;
+            }
+          }
         }
 
-        // Delete current assignment
-        await trx('lead_assignments').where({ lead_id: leadId }).delete();
-        await logActivity(trx, leadId, req.user.id, 'cross', remark || `Closed/Lost: ${dropReason}`);
-      } 
-      else if (outcome === 'tick') {
-        // Advance Stage
-        if (currentStage === 'L1') {
-          // L1 -> L2 Triage
-          await trx('lead_assignments').where({ lead_id: leadId }).update({
-            stage: 'L2',
-            updated_at: new Date()
-          });
+        await trx('lead_assignments').where({ lead_id: leadId }).update(updates);
 
-          // Optional: Update lead's salary parameter with their budget
-          if (budget) {
-            await trx('leads').where({ id: leadId }).update({
-              salary: parseFloat(budget),
-              updated_at: new Date()
-            });
-          }
+        const statusLogSuffix = counselingStatus === 'Not Contactable' ? ` (${notContactableReason})` : '';
+        const remarkSuffix = remark ? ` — ${remark}` : '';
+        await logActivity(trx, leadId, req.user.id, 'status_change', `${STATUS_LOG_PREFIX}${counselingStatus}${statusLogSuffix}${remarkSuffix}`);
 
-          // Create follow-up schedule
-          if (followUpDate) {
-            await trx('follow_ups').insert({
-              id: randomUUID(),
-              lead_id: leadId,
-              counselor_id: req.user.id,
-              follow_up_date: new Date(followUpDate),
-              notes: remark || 'Scheduled L2 Follow-up',
-              completed: false,
-              created_at: new Date()
-            });
-          }
+        if (counselingStatus === 'Lead Punched' && registrationStatus === 'Registered' && assignment.registration_status !== 'Registered') {
+          await logActivity(trx, leadId, req.user.id, 'registration_update', `Registered${universityId ? '' : ''}${remark ? ` — ${remark}` : ''}`);
+        }
+        if (counselingStatus === 'Lead Punched' && feePaymentStatus && feePaymentStatus !== assignment.fee_payment_status) {
+          await logActivity(trx, leadId, req.user.id, 'fee_update', `Fee payment status changed to: ${feePaymentStatus}${feeAmountPaid ? ` (₹${feeAmountPaid})` : ''}`);
+        }
 
-          let triageUnivText = '';
-          if (universityId) {
-            const uRec = await trx('universities').where({ id: universityId }).first();
-            if (uRec) triageUnivText = `, University Interest: ${uRec.name}`;
-          }
-          const triageNotes = `Qualified. [Working Pref: ${isWorkingPref ? 'Yes' : 'No'}, Budget: ₹${budget || 'N/A'}, Eligible: ${isEligible ? 'Yes' : 'No'}${triageUnivText}]. Notes: ${remark || ''}`;
-          await logActivity(trx, leadId, req.user.id, 'tick', triageNotes);
-        } 
-        else if (currentStage === 'L2') {
-          // L2 -> L3
-          await trx('lead_assignments').where({ lead_id: leadId }).update({
-            stage: 'L3',
-            updated_at: new Date()
-          });
-
-          // Complete any pending follow-ups for this lead
+        // Call Back schedules the next call the same way the dedicated /follow-up
+        // endpoint does — completes any still-open follow-up for this lead first so a
+        // repeated Call Back doesn't pile up multiple "due" reminders for the same lead.
+        if (counselingStatus === 'Call Back' && followUpDate) {
           await trx('follow_ups')
             .where({ lead_id: leadId, counselor_id: req.user.id, completed: false })
             .update({ completed: true, completed_at: new Date() });
-
-          // Save budget details if provided
-          if (budget) {
-            await trx('leads').where({ id: leadId }).update({
-              salary: parseFloat(budget),
-              updated_at: new Date()
-            });
-          }
-
-          // Create draft closure record
-          const existingClosure = await trx('closures').where({ lead_id: leadId }).first();
-          const initialChecklist = {
-            registrationNumber: '',
-            degree: false,
-            transcripts: false,
-            idProof: false,
-            workExp: false,
-            documentsSubmitted: false,
-            feesPaid: false,
-            paymentMode: 'UPI',
-            feeReceiptConfirmed: false,
-            feesConfirmed: false
-          };
-          if (existingClosure) {
-            await trx('closures').where({ lead_id: leadId }).update({
-              university_id: universityId || existingClosure.university_id,
-              documents_status: JSON.stringify(initialChecklist),
-              application_status: 'Pending',
-              final_status: 'pending_enrollment',
-              counselor_id: req.user.id
-            });
-          } else {
-            await trx('closures').insert({
-              id: randomUUID(),
-              lead_id: leadId,
-              university_id: universityId || null,
-              documents_status: JSON.stringify(initialChecklist),
-              application_status: 'Pending',
-              final_status: 'pending_enrollment',
-              revenue: 0,
-              counselor_id: req.user.id,
-              created_at: new Date()
-            });
-          }
-
-          let advUnivText = '';
-          if (universityId) {
-            const uRec = await trx('universities').where({ id: universityId }).first();
-            if (uRec) advUnivText = `, University Interest: ${uRec.name}`;
-          }
-          const punchNotes = `Lead Punched & Advanced. [Working Pref: ${isWorkingPref ? 'Yes' : 'No'}, Budget: ₹${budget || 'N/A'}, Eligible: ${isEligible ? 'Yes' : 'No'}${advUnivText}]. Notes: ${remark || ''}`;
-          await logActivity(trx, leadId, req.user.id, 'tick', punchNotes);
-        } 
-        else if (currentStage === 'L3') {
-          // L3 step-by-step updates or final closure
-          const isFinalEnrollment = !!(docChecklist && docChecklist.feesConfirmed);
-
-          // Upsert closure record
-          const existingClosure = await trx('closures').where({ lead_id: leadId }).first();
-          if (existingClosure) {
-            await trx('closures').where({ lead_id: leadId }).update({
-              university_id: universityId || existingClosure.university_id,
-              documents_status: JSON.stringify(docChecklist || {}),
-              application_status: applicationStatus || existingClosure.application_status || 'Pending',
-              final_status: isFinalEnrollment ? 'enrolled' : 'pending_enrollment',
-              revenue: parseFloat(revenue || existingClosure.revenue || 0),
-              counselor_id: req.user.id,
-              closed_at: isFinalEnrollment ? new Date() : null
-            });
-          } else {
-            await trx('closures').insert({
-              id: randomUUID(),
-              lead_id: leadId,
-              university_id: universityId || null,
-              documents_status: JSON.stringify(docChecklist || {}),
-              application_status: applicationStatus || 'Pending',
-              final_status: isFinalEnrollment ? 'enrolled' : 'pending_enrollment',
-              revenue: parseFloat(revenue || 0),
-              counselor_id: req.user.id,
-              created_at: new Date(),
-              closed_at: isFinalEnrollment ? new Date() : null
-            });
-          }
-
-          if (isFinalEnrollment) {
-            // Delete active assignment since it's fully closed
-            await trx('lead_assignments').where({ lead_id: leadId }).delete();
-            await logActivity(trx, leadId, req.user.id, 'tick', remark || 'Successfully closed lead: Enrolled');
-          } else {
-            // Just update updated_at on the assignment and log the step
-            await trx('lead_assignments').where({ lead_id: leadId }).update({
-              updated_at: new Date()
-            });
-            await logActivity(trx, leadId, req.user.id, 'note', remark || 'Updated L3 application steps');
-          }
+          await trx('follow_ups').insert({
+            id: randomUUID(),
+            lead_id: leadId,
+            counselor_id: req.user.id,
+            follow_up_date: new Date(followUpDate),
+            notes: remark,
+            completed: false,
+            created_at: new Date()
+          });
         }
+        return;
       }
+
+      // Terminal: upsert a closures row (mirrors the old cross/enrollment pattern) and
+      // delete the active assignment.
+      const finalStatus = counselingStatus === 'Lead Punched' ? 'enrolled' : (
+        counselingStatus === 'Not Interested' ? 'lost' :
+          counselingStatus === 'Duplicate Lead' ? 'duplicate' : 'job_seeker'
+      );
+      const isEnrolled = finalStatus === 'enrolled';
+      const revenueAmount = isEnrolled ? parseFloat(feeAmountPaid || feeTotalAmount || 0) : 0;
+
+      const existingClosure = await trx('closures').where({ lead_id: leadId }).first();
+      const closurePayload = {
+        university_id: universityId || (existingClosure ? existingClosure.university_id : null),
+        application_status: isEnrolled ? 'Approved' : 'rejected',
+        final_status: finalStatus,
+        revenue: revenueAmount,
+        counselor_id: req.user.id,
+        drop_stage: counselingStatus,
+        drop_remark: remark,
+        closed_at: new Date(),
+        // Preserves whether this lead was Carry Forward or Fresh at the moment it closed —
+        // the assignment row is about to be deleted below, so this is the only place left
+        // to capture it for the CF Ahead/Pending reporting split.
+        assignment_assigned_at: assignment.assigned_at
+      };
+      if (existingClosure) {
+        await trx('closures').where({ lead_id: leadId }).update(closurePayload);
+      } else {
+        await trx('closures').insert({
+          id: randomUUID(),
+          lead_id: leadId,
+          documents_status: JSON.stringify({}),
+          created_at: new Date(),
+          ...closurePayload
+        });
+      }
+
+      await trx('leads').where({ id: leadId }).update({
+        status: isEnrolled ? 'enrolled' : (counselingStatus === 'Duplicate Lead' ? 'duplicate' : 'closed'),
+        updated_at: new Date()
+      });
+
+      await trx('lead_assignments').where({ lead_id: leadId }).delete();
+
+      // Closing the lead out entirely — any still-open follow-up (e.g. a previously
+      // scheduled Call Back) is now moot; leaving it incomplete would keep inflating the
+      // "due follow-ups" count with a lead that's no longer even in the active pool.
+      await trx('follow_ups')
+        .where({ lead_id: leadId, completed: false })
+        .update({ completed: true, completed_at: new Date() });
+
+      const logAction = isEnrolled ? 'tick' : 'cross';
+      const logRemark = isEnrolled
+        ? `Successfully closed lead: Enrolled (Fee Full, ₹${revenueAmount})`
+        : `Closed/Lost: ${counselingStatus}${remark ? ` — ${remark}` : ''}`;
+      await logActivity(trx, leadId, req.user.id, logAction, logRemark);
     });
 
-    res.json({ message: 'Lead action recorded successfully.' });
+    res.json({ message: 'Status updated successfully.' });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ error: err.message || 'Action failed' });
+    res.status(400).json({ error: err.message || 'Failed to update status' });
+  }
+});
+
+// GET /api/leads/:id/remarks — full remarks history for a lead (every status change,
+// note, registration/fee update, forward, and final outcome that carried a remark),
+// newest first. Used by every dashboard's "view remarks" detail panel since a lead can
+// accumulate several remarks over time and the live lead_assignments.status_remark
+// column only ever holds the latest one.
+app.get('/api/leads/:id/remarks', authenticateToken, requireRole(['counselor', 'manager', 'team_leader', 'super_admin']), async (req, res) => {
+  const leadId = req.params.id;
+  try {
+    if (req.user.role === 'counselor') {
+      const assignment = await db('lead_assignments').where({ lead_id: leadId, counselor_id: req.user.id }).first();
+      const closure = await db('closures').where({ lead_id: leadId, counselor_id: req.user.id }).first();
+      if (!assignment && !closure) {
+        return res.status(403).json({ error: 'Access denied: You do not own this lead.' });
+      }
+    }
+
+    let query = db('lead_activity_log')
+      .join('users', 'lead_activity_log.counselor_id', 'users.id')
+      .where('lead_activity_log.lead_id', leadId)
+      .whereNotNull('lead_activity_log.remark');
+
+    if (req.user.role === 'team_leader') {
+      if (!req.user.team_id) return res.json([]);
+      query = query.where('users.team_id', req.user.team_id);
+    }
+
+    const remarks = await query
+      .select(
+        'lead_activity_log.id',
+        'lead_activity_log.action',
+        'lead_activity_log.remark',
+        'lead_activity_log.timestamp',
+        'users.name as counselor_name'
+      )
+      .orderBy('lead_activity_log.timestamp', 'desc');
+
+    res.json(remarks);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch remarks history' });
   }
 });
 
@@ -1529,6 +2193,10 @@ app.post('/api/counselor/leads/:id/follow-up', authenticateToken, requireRole(['
   const leadId = req.params.id;
   const { followUpDate, notes, universityDiscussed, courseDiscussed, feeDiscussed, universityId } = req.body;
 
+  if (!notes || !notes.trim()) {
+    return res.status(400).json({ error: 'Call notes are required.' });
+  }
+
   try {
     await db.transaction(async (trx) => {
       // 1. Verify owner
@@ -1536,6 +2204,13 @@ app.post('/api/counselor/leads/:id/follow-up', authenticateToken, requireRole(['
       if (!assignment) {
         throw new Error('Access denied: You do not own this lead.');
       }
+
+      // A call was just logged against this assignment — bump its updated_at the same way
+      // a status change does. Without this, the "Last Updated" column on the Manager/Team
+      // Leader Daily Tracker (and anything else keying off lead_assignments.updated_at)
+      // kept showing whenever the status was last changed, silently ignoring every call
+      // logged through this endpoint in between.
+      await trx('lead_assignments').where({ lead_id: leadId }).update({ updated_at: new Date() });
 
       // Update interested university if provided
       if (universityId) {
@@ -1585,22 +2260,18 @@ app.post('/api/counselor/leads/:id/follow-up', authenticateToken, requireRole(['
 
 // Get counselor personal performance statistics
 app.get('/api/counselor/performance', authenticateToken, requireRole(['counselor']), async (req, res) => {
+  const { period } = req.query; // 'today' | 'week' | 'month' | omitted = all-time
   try {
-    // 1. Stage Counts from current active assignments
-    const activeAssignments = await db('lead_assignments')
-      .where({ counselor_id: req.user.id })
-      .groupBy('stage')
-      .select('stage')
-      .count('id as count');
-
-    const activeCounts = { L1: 0, L2: 0, L3: 0 };
-    activeAssignments.forEach(a => {
-      activeCounts[a.stage] = parseInt(a.count || 0, 10);
-    });
+    // 1. Data Report (Fresh/Carry Forward/Touched) for this counselor, self-scoped.
+    const dataReport = await computeDataReport(db, { counselorIds: [req.user.id] });
+    const myReport = dataReport.perCounselor[0] || { openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0 };
 
     // 2. Closures (Enrolled vs Lost)
+    // Filter directly on closures.counselor_id — a lead dropped straight from L1 never
+    // gets a 'tick' activity log, so inferring ownership through that log silently
+    // excluded those drops from the counselor's own stats.
     const closuresSummary = await db('closures')
-      .whereIn('lead_id', db('lead_activity_log').where({ counselor_id: req.user.id, action: 'tick' }).select('lead_id'))
+      .where({ counselor_id: req.user.id })
       .groupBy('final_status')
       .select('final_status')
       .count('id as count')
@@ -1624,35 +2295,50 @@ app.get('/api/counselor/performance', authenticateToken, requireRole(['counselor
       .where({ counselor_id: req.user.id, completed: true })
       .count('id as count')
       .first();
-    
+
     const pendingFollowups = await db('follow_ups')
       .where({ counselor_id: req.user.id, completed: false })
       .count('id as count')
       .first();
 
     // 4. Monthly Target & Progress
-    const currentMonth = new Date().toISOString().substring(0, 7); // e.g. "2026-07"
+    const currentMonth = getCurrentMonthKeyIST(); // e.g. "2026-07"
     const targetRecord = await db('targets')
       .where({ counselor_id: req.user.id, target_month: currentMonth })
       .first();
     const monthlyTarget = targetRecord ? targetRecord.target_count : 10; // default target is 10
 
-    const startOfMonth = new Date();
-    startOfMonth.setDate(1);
-    startOfMonth.setHours(0, 0, 0, 0);
+    // IST midnight on the 1st of currentMonth, as an absolute instant — NOT
+    // `new Date(); setDate(1); setHours(0,0,0,0)`, which depends on the server process's
+    // local timezone (ambiguous across dev/production) and could disagree with
+    // currentMonth's IST-based bucket near either month boundary.
+    const startOfMonth = new Date(`${currentMonth}-01T00:00:00+05:30`);
 
     const monthlyEnrolledRecord = await db('closures')
-      .whereIn('lead_id', db('lead_activity_log').where({ counselor_id: req.user.id, action: 'tick' }).select('lead_id'))
-      .andWhere({ final_status: 'enrolled' })
-      .andWhere('closed_at', '>=', startOfMonth)
+      .where({ counselor_id: req.user.id, final_status: 'enrolled' })
+      .andWhere('closed_at', '>=', serializeDate(startOfMonth))
       .count('id as count')
       .first();
 
     const monthlyEnrolledCount = parseInt(monthlyEnrolledRecord.count || 0, 10);
     const targetLeft = Math.max(0, monthlyTarget - monthlyEnrolledCount);
 
+    // 5. Data Status (L1) breakdown — sourced from confirmed 'status_change' log entries
+    // rather than the live counseling_status column, so drops don't erase history and a
+    // daily/weekly/monthly breakdown is actually possible.
+    const periodRange = getPeriodRange(period);
+    let statusLogQuery = db('lead_activity_log')
+      .where({ counselor_id: req.user.id, action: 'status_change' });
+    if (periodRange) {
+      statusLogQuery = statusLogQuery
+        .where('timestamp', '>=', serializeDate(periodRange.start))
+        .where('timestamp', '<=', serializeDate(periodRange.end));
+    }
+    const statusLogs = await statusLogQuery.select('lead_id', 'action', 'remark', 'timestamp');
+    const statusSummary = computeStatusSummary(statusLogs);
+
     res.json({
-      activeAssignments: activeCounts,
+      dataReport: myReport,
       enrolledCount,
       lostCount,
       totalRevenue,
@@ -1660,7 +2346,8 @@ app.get('/api/counselor/performance', authenticateToken, requireRole(['counselor
       pendingFollowups: parseInt(pendingFollowups.count || 0, 10),
       monthlyTarget,
       monthlyEnrolledCount,
-      targetLeft
+      targetLeft,
+      statusSummary
     });
   } catch (err) {
     console.error(err);
@@ -1703,63 +2390,37 @@ app.post('/api/manager/targets', authenticateToken, requireRole(['super_admin', 
 // Get list of dates counselor worked on (leads assigned) with summary statistics
 app.get('/api/counselor/history/dates', authenticateToken, requireRole(['counselor']), async (req, res) => {
   try {
-    const isSQLite = db.client.config.client === 'sqlite3';
-    const dateExpr = isSQLite ? "DATE(timestamp / 1000, 'unixepoch')" : "DATE(timestamp)";
-
-    // 1. Get all work history / activity actions for this counselor
-    const assignments = await db('lead_activity_log')
+    // Reconstruct each date's counts from that day's actual status, not today's — see
+    // reconstructDailyStatusStates() for why the previous "join current live state"
+    // approach retroactively rewrote a lead's earlier history to match its final outcome.
+    const logs = await db('lead_activity_log')
       .where({ counselor_id: req.user.id })
       .whereNotNull('lead_id')
-      .select('lead_id', db.raw(`${dateExpr} as date_assigned`))
-      .groupBy('lead_id', db.raw(dateExpr));
+      // Exclude 'distributed' — reconstructDailyStatusStates stamps a 'Not Contacted' entry
+      // for ANY log row regardless of action, so without this, a lead auto-logged as
+      // distributed on a given day counted as "worked" that day even with zero real activity.
+      .whereNot('action', 'distributed')
+      .select('lead_id', 'action', 'remark', 'timestamp');
 
-    if (assignments.length === 0) {
+    if (logs.length === 0) {
       return res.json([]);
     }
 
-    const leadIds = assignments.map(a => a.lead_id);
+    const dateStateMap = reconstructDailyStatusStates(logs);
 
-    // 2. Fetch current stages of these leads
-    const activeStates = await db('lead_assignments')
-      .whereIn('lead_id', leadIds)
-      .select('lead_id', 'stage');
-    const activeMap = {};
-    activeStates.forEach(s => {
-      activeMap[s.lead_id] = s.stage;
+    // Keyed by the raw counseling_status string (e.g. group['Lead Punched']) rather than
+    // a fixed camelCase field list, so the frontend can render whatever statuses actually
+    // occurred that day via Object.entries() without both sides needing to stay in sync.
+    const dateGroups = Object.entries(dateStateMap).map(([dateStr, leadStates]) => {
+      const group = { date: dateStr, total: 0 };
+      Object.values(leadStates).forEach(status => {
+        group.total++;
+        group[status] = (group[status] || 0) + 1;
+      });
+      return group;
     });
 
-    // 3. Fetch closures of these leads
-    const closureStates = await db('closures')
-      .whereIn('lead_id', leadIds)
-      .select('lead_id', 'final_status');
-    const closureMap = {};
-    closureStates.forEach(c => {
-      closureMap[c.lead_id] = c.final_status;
-    });
-
-    // 4. Group by date
-    const dateGroups = {};
-    assignments.forEach(a => {
-      if (!a.date_assigned) return; // Skip if null
-      const dStr = new Date(a.date_assigned).toISOString().split('T')[0];
-      if (!dateGroups[dStr]) {
-        dateGroups[dStr] = { date: dStr, total: 0, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0 };
-      }
-      dateGroups[dStr].total++;
-      const stage = activeMap[a.lead_id];
-      const closure = closureMap[a.lead_id];
-
-      if (stage) {
-        dateGroups[dStr][stage]++;
-      } else if (closure === 'enrolled') {
-        dateGroups[dStr].enrolled++;
-      } else {
-        // Was dropped, lost, or crossed
-        dateGroups[dStr].lost++;
-      }
-    });
-
-    const result = Object.values(dateGroups).sort((a, b) => b.date.localeCompare(a.date));
+    const result = dateGroups.sort((a, b) => b.date.localeCompare(a.date));
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -1771,21 +2432,26 @@ app.get('/api/counselor/history/dates', authenticateToken, requireRole(['counsel
 app.get('/api/counselor/history/dates/:date', authenticateToken, requireRole(['counselor']), async (req, res) => {
   const { date } = req.params;
   try {
-    const isSQLite = db.client.config.client === 'sqlite3';
-    const dateExpr = isSQLite ? "DATE(timestamp / 1000, 'unixepoch')" : "DATE(timestamp)";
-
-    const assignments = await db('lead_activity_log')
+    // Need the counselor's FULL activity history (not just this date) to correctly
+    // replay each lead's status up through the end of the requested date — see
+    // reconstructDailyStatusStates() for why using current live status here would
+    // retroactively rewrite this date's history to match a later outcome.
+    const logs = await db('lead_activity_log')
       .where({ counselor_id: req.user.id })
       .whereNotNull('lead_id')
-      .andWhereRaw(`${dateExpr} = ?`, [date])
-      .select('lead_id')
-      .groupBy('lead_id');
+      // Exclude 'distributed' — reconstructDailyStatusStates stamps a 'Not Contacted' entry
+      // for ANY log row regardless of action, so without this, a lead auto-logged as
+      // distributed on a given day counted as "worked" that day even with zero real activity.
+      .whereNot('action', 'distributed')
+      .select('lead_id', 'action', 'remark', 'timestamp');
 
-    if (assignments.length === 0) {
-      return res.json({ summary: { total: 0, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0 }, leads: [] });
+    const dateStateMap = reconstructDailyStatusStates(logs);
+    const leadStatesForDate = dateStateMap[date] || {};
+    const leadIds = Object.keys(leadStatesForDate);
+
+    if (leadIds.length === 0) {
+      return res.json({ summary: { total: 0 }, leads: [] });
     }
-
-    const leadIds = assignments.map(a => a.lead_id);
 
     const leadsData = await db('leads')
       .whereIn('leads.id', leadIds)
@@ -1794,23 +2460,16 @@ app.get('/api/counselor/history/dates/:date', authenticateToken, requireRole(['c
       .leftJoin('universities', 'closures.university_id', 'universities.id')
       .select(
         'leads.*',
-        'lead_assignments.stage',
-        'lead_assignments.disposition',
-        'closures.final_status as closure_status',
         'closures.revenue as closure_revenue',
         'universities.name as closure_university'
       )
       .orderBy('leads.created_at', 'desc');
 
-    const summary = { total: leadsData.length, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0 };
+    const summary = { total: leadsData.length };
     leadsData.forEach(l => {
-      if (l.stage) {
-        summary[l.stage]++;
-      } else if (l.closure_status === 'enrolled') {
-        summary.enrolled++;
-      } else {
-        summary.lost++;
-      }
+      const status = leadStatesForDate[l.id]; // as of this date
+      summary[status] = (summary[status] || 0) + 1;
+      l.counseling_status = status;
     });
 
     res.json({ summary, leads: leadsData });
@@ -1980,17 +2639,42 @@ app.post('/api/transfers/resolve/:id', authenticateToken, requireRole(['manager'
         // Delete old assignment
         await trx('lead_assignments').where({ lead_id: request.lead_id }).delete();
 
-        // Insert new assignment
+        // Insert new assignment — a transfer is a change of OWNER, not a reset of the
+        // lead's actual progress. Carrying counseling_status/registration/fee state
+        // forward from the old assignment avoids a lead already marked Lead Punched
+        // (with real work behind it — university interest, registration, partial fee)
+        // silently resetting to Not Contacted on transfer. assigned_at is bumped to now
+        // so the new counselor correctly sees this as their Fresh Base today.
         await trx('lead_assignments').insert({
           id: randomUUID(),
           lead_id: request.lead_id,
           counselor_id: finalTarget,
           assigned_by: req.user.id,
           assigned_at: new Date(),
-          stage: 'L1',
+          stage: currentAssign ? currentAssign.stage : 'L1',
+          disposition: currentAssign ? currentAssign.disposition : 'None',
+          counseling_status: currentAssign ? currentAssign.counseling_status : 'Not Contacted',
+          not_contactable_reason: currentAssign ? currentAssign.not_contactable_reason : null,
+          registration_status: currentAssign ? currentAssign.registration_status : 'Not Registered',
+          registration_date: currentAssign ? currentAssign.registration_date : null,
+          fee_payment_status: currentAssign ? currentAssign.fee_payment_status : 'None',
+          fee_amount_paid: currentAssign ? currentAssign.fee_amount_paid : null,
+          fee_total_amount: currentAssign ? currentAssign.fee_total_amount : null,
+          fee_reminder_due_at: currentAssign ? currentAssign.fee_reminder_due_at : null,
+          fee_reminder_note: currentAssign ? currentAssign.fee_reminder_note : null,
           locked: true,
           updated_at: new Date()
         });
+
+        // Carry any still-open follow-up (e.g. a scheduled Call Back) over to the new
+        // owner. Without this it stays attributed to the old counselor_id — invisible to
+        // the new owner (who now owns the lead) while still counting as "due" for the old
+        // owner (who no longer does), even though the callback itself is still legitimate.
+        if (oldOwnerId) {
+          await trx('follow_ups')
+            .where({ lead_id: request.lead_id, counselor_id: oldOwnerId, completed: false })
+            .update({ counselor_id: finalTarget });
+        }
 
         // Log resolution
         await logActivity(trx, request.lead_id, finalTarget, 'transfer_approve', `Transfer request approved by ${req.user.name}. Owner reassigned.`);
@@ -2010,35 +2694,56 @@ app.post('/api/transfers/resolve/:id', authenticateToken, requireRole(['manager'
 // --- MASTER LEAD REPOSITORY ---
 
 app.get('/api/leads/master', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
-  const { batch_id, stage, status, source } = req.query;
+  const { batch_id, counselingStatus, status, source } = req.query;
 
   try {
+    // Counselor name falls back to closures.counselor_id — dropping a lead deletes its
+    // lead_assignments row, so relying on that join alone leaves every dropped lead's
+    // counselor blank.
     let query = db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
+      .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
       .leftJoin('universities', 'leads.university_id', 'universities.id');
 
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
         return res.json([]);
       }
-      query = query.where({ 'counselors.team_id': req.user.team_id });
+      // Filtering directly on the left-joined 'counselors.team_id' would silently turn
+      // this into an inner join — any lead with no CURRENT assignment (i.e. every dropped
+      // lead) has counselors.team_id = NULL, which never matches and gets excluded even
+      // though it belongs to this team via closures.counselor_id. Scope by team membership
+      // instead, checked against either source of counselor attribution.
+      const teamCounselorIds = db('users').where({ team_id: req.user.team_id, role: 'counselor' }).select('id');
+      query = query.where(function () {
+        this.whereIn('lead_assignments.counselor_id', teamCounselorIds)
+          .orWhereIn('closures.counselor_id', teamCounselorIds);
+      });
     }
 
     query = query.select(
-        'leads.*',
-        'lead_assignments.stage',
-        'lead_assignments.locked',
-        'counselors.name as counselor_name',
-        'universities.name as university_name'
-      );
+      'leads.*',
+      'lead_assignments.counseling_status',
+      'lead_assignments.not_contactable_reason',
+      'lead_assignments.status_remark',
+      'lead_assignments.registration_status',
+      'lead_assignments.fee_payment_status',
+      'lead_assignments.fee_amount_paid',
+      'lead_assignments.fee_total_amount',
+      'lead_assignments.fee_reminder_due_at',
+      'lead_assignments.locked',
+      db.raw('COALESCE(counselors.name, closure_counselors.name) as counselor_name'),
+      'universities.name as university_name'
+    );
 
     if (batch_id) {
       query = query.where({ 'leads.upload_batch_id': batch_id });
     }
 
-    if (stage) {
-      query = query.where({ 'lead_assignments.stage': stage });
+    if (counselingStatus) {
+      query = query.where({ 'lead_assignments.counseling_status': counselingStatus });
     }
 
     if (status) {
@@ -2063,11 +2768,19 @@ app.get('/api/leads/:id/timeline', authenticateToken, requireRole(['super_admin'
 
   try {
     if (req.user.role === 'team_leader') {
+      // Checked via lead_assignments (currently active leads) OR closures.counselor_id
+      // (enrolled/dropped leads) — dropping or enrolling a lead deletes its
+      // lead_assignments row, so the assignment-only check would deny access to a
+      // team leader's own team's history the moment a lead is closed either way.
       const assigned = await db('lead_assignments')
         .join('users', 'lead_assignments.counselor_id', 'users.id')
         .where({ 'lead_assignments.lead_id': leadId, 'users.team_id': req.user.team_id })
         .first();
-      if (!assigned) {
+      const closedByTeam = assigned ? null : await db('closures')
+        .join('users', 'closures.counselor_id', 'users.id')
+        .where({ 'closures.lead_id': leadId, 'users.team_id': req.user.team_id })
+        .first();
+      if (!assigned && !closedByTeam) {
         return res.status(403).json({ error: 'Access denied: Lead is not assigned to your team.' });
       }
     }
@@ -2087,37 +2800,85 @@ app.get('/api/leads/:id/timeline', authenticateToken, requireRole(['super_admin'
 
 // --- REPORTS & PIPELINE METRICS ---
 
-app.get('/api/reports/pipeline', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
+// Data Report: Opening CF / Fresh Base / Total Base / Touched Base / Touch%, per
+// counselor + aggregate. Replaces the old L1/L2/L3 pipeline funnel.
+app.get('/api/reports/data-report', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
   try {
-    let stagesQuery = db('lead_assignments');
+    if (req.user.role === 'team_leader' && !req.user.team_id) {
+      return res.json({ perCounselor: [], aggregate: { openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0 } });
+    }
+    const scope = req.user.role === 'team_leader' ? { teamId: req.user.team_id } : {};
+    const report = await computeDataReport(db, scope);
+    res.json(report);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch data report' });
+  }
+});
+
+// Data Status (L1): counts by the 6 flat statuses + Not Contactable sub-reasons +
+// Lead Punched registration/fee breakdown + closures summary. Replaces the old
+// stage/disposition-based /api/reports/pipeline.
+app.get('/api/reports/data-status', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
+  try {
+    let statusQuery = db('lead_assignments');
+    let notContactableQuery = db('lead_assignments').where({ counseling_status: 'Not Contactable' });
+    let punchedQuery = db('lead_assignments').where({ counseling_status: 'Lead Punched' });
     let closuresQuery = db('closures');
+    let temperatureQuery = db('leads').join('lead_assignments', 'leads.id', 'lead_assignments.lead_id');
+    let unassignedRoleBlocked = false;
 
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
-        return res.json({ stages: [], closures: [], unassigned: 0 });
+        return res.json({
+          statusCounts: [], notContactableBreakdown: [], leadPunchedBreakdown: { registrationStatus: [], feePaymentStatus: [] },
+          unassigned: 0, closuresSummary: [], leadTemperatureBreakdown: []
+        });
       }
-      stagesQuery = stagesQuery
-        .join('users', 'lead_assignments.counselor_id', 'users.id')
-        .where({ 'users.team_id': req.user.team_id });
-      closuresQuery = closuresQuery
-        .whereIn('closures.counselor_id', db('users').where({ team_id: req.user.team_id }).select('id'));
+      statusQuery = statusQuery.join('users', 'lead_assignments.counselor_id', 'users.id').where('users.team_id', req.user.team_id);
+      notContactableQuery = notContactableQuery.join('users', 'lead_assignments.counselor_id', 'users.id').where('users.team_id', req.user.team_id);
+      punchedQuery = punchedQuery.join('users', 'lead_assignments.counselor_id', 'users.id').where('users.team_id', req.user.team_id);
+      closuresQuery = closuresQuery.whereIn('closures.counselor_id', db('users').where({ team_id: req.user.team_id }).select('id'));
+      temperatureQuery = temperatureQuery.join('users', 'lead_assignments.counselor_id', 'users.id').where('users.team_id', req.user.team_id);
+      unassignedRoleBlocked = true;
     }
 
-    // 1. Stages counts
-    const stagesCounts = await stagesQuery
-      .groupBy('lead_assignments.stage')
-      .select('lead_assignments.stage')
+    const statusCounts = await statusQuery
+      .groupBy('lead_assignments.counseling_status')
+      .select('lead_assignments.counseling_status')
       .count('lead_assignments.id as count');
 
-    // 2. Closure counts (enrolled vs lost)
-    const closureCounts = await closuresQuery
+    const notContactableBreakdown = await notContactableQuery
+      .groupBy('lead_assignments.not_contactable_reason')
+      .select('lead_assignments.not_contactable_reason')
+      .count('lead_assignments.id as count');
+
+    const registrationBreakdown = await punchedQuery.clone()
+      .groupBy('lead_assignments.registration_status')
+      .select('lead_assignments.registration_status')
+      .count('lead_assignments.id as count');
+
+    const feeBreakdown = await punchedQuery.clone()
+      .groupBy('lead_assignments.fee_payment_status')
+      .select('lead_assignments.fee_payment_status')
+      .count('lead_assignments.id as count');
+
+    const closuresSummary = await closuresQuery
       .groupBy('closures.final_status')
       .select('closures.final_status')
       .count('closures.id as count')
       .sum('closures.revenue as total_revenue');
 
-    // 3. Unassigned counts
-    const unassignedCount = req.user.role === 'team_leader' ? { count: 0 } : await db('leads')
+    // Hot/Warm/Cold intent classification on currently active Interested/Lead
+    // Punched/Duplicate Lead leads — distinct from the 'Cold' counseling_status above,
+    // which is about contact-ability, not sales intent.
+    const leadTemperatureBreakdown = await temperatureQuery
+      .whereNotNull('leads.lead_temperature')
+      .groupBy('leads.lead_temperature')
+      .select('leads.lead_temperature')
+      .count('leads.id as count');
+
+    const unassignedCount = unassignedRoleBlocked ? { count: 0 } : await db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .where({ 'leads.status': 'clean' })
       .whereNull('lead_assignments.id')
@@ -2125,65 +2886,59 @@ app.get('/api/reports/pipeline', authenticateToken, requireRole(['super_admin', 
       .first();
 
     res.json({
-      stages: stagesCounts,
-      closures: closureCounts,
-      unassigned: parseInt(unassignedCount.count || 0, 10)
+      statusCounts,
+      notContactableBreakdown,
+      leadPunchedBreakdown: { registrationStatus: registrationBreakdown, feePaymentStatus: feeBreakdown },
+      unassigned: parseInt(unassignedCount.count || 0, 10),
+      closuresSummary,
+      leadTemperatureBreakdown
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch reports' });
+    res.status(500).json({ error: 'Failed to fetch data status report' });
   }
 });
 
-// Counselor Leaderboard — enrolled, lost, active leads per counselor
+// Counselor Leaderboard — Data Report fields (Opening CF/Fresh/Total/Touched/Touch%)
+// plus enrolled/lost/revenue per counselor.
 app.get('/api/reports/counselor-leaderboard', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
   try {
-    let activeQuery = db('lead_assignments')
-      .join('users', 'lead_assignments.counselor_id', 'users.id')
-      .groupBy('lead_assignments.counselor_id', 'users.name', 'lead_assignments.stage')
-      .select('lead_assignments.counselor_id', 'users.name as counselor_name', 'lead_assignments.stage')
-      .count('lead_assignments.id as cnt');
+    if (req.user.role === 'team_leader' && !req.user.team_id) {
+      return res.json([]);
+    }
+    const scope = req.user.role === 'team_leader' ? { teamId: req.user.team_id } : {};
+    const { perCounselor } = await computeDataReport(db, scope);
 
-    let closuresQuery = db('lead_activity_log')
-      .join('closures', 'lead_activity_log.lead_id', 'closures.lead_id')
-      .join('users', 'lead_activity_log.counselor_id', 'users.id')
-      .where({ 'lead_activity_log.action': 'tick' })
-      .groupBy('lead_activity_log.counselor_id', 'users.name', 'closures.final_status')
-      .select('lead_activity_log.counselor_id', 'users.name as counselor_name', 'closures.final_status')
+    // Attribute closures directly via closures.counselor_id (set whenever a closure is
+    // created/updated) rather than inferring it through activity logs — a lead dropped
+    // straight from a non-terminal status never gets a 'tick' log, so joining through
+    // that log silently dropped it from the leaderboard even though it's a real closure.
+    let closuresQuery = db('closures')
+      .join('users', 'closures.counselor_id', 'users.id')
+      .groupBy('closures.counselor_id', 'users.name', 'closures.final_status')
+      .select('closures.counselor_id', 'users.name as counselor_name', 'closures.final_status')
       .count('closures.id as cnt')
       .sum('closures.revenue as total_revenue');
 
     if (req.user.role === 'team_leader') {
-      if (!req.user.team_id) {
-        return res.json([]);
-      }
-      activeQuery = activeQuery.where({ 'users.team_id': req.user.team_id });
       closuresQuery = closuresQuery.where({ 'users.team_id': req.user.team_id });
     }
-
-    // Active leads per counselor per stage
-    const activeLeads = await activeQuery;
-
-    // Closures per counselor
     const closures = await closuresQuery;
 
-    // Merge
     const counselorMap = {};
-
-    activeLeads.forEach(r => {
-      if (!counselorMap[r.counselor_id]) {
-        counselorMap[r.counselor_id] = { id: r.counselor_id, name: r.counselor_name, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0, revenue: 0 };
-      }
-      counselorMap[r.counselor_id][r.stage] = parseInt(r.cnt, 10);
+    perCounselor.forEach(c => {
+      counselorMap[c.id] = { ...c, enrolled: 0, lost: 0, revenue: 0 };
     });
 
     closures.forEach(c => {
       if (!counselorMap[c.counselor_id]) {
-        counselorMap[c.counselor_id] = { id: c.counselor_id, name: c.counselor_name, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0, revenue: 0 };
+        counselorMap[c.counselor_id] = { id: c.counselor_id, name: c.counselor_name, openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0, enrolled: 0, lost: 0, revenue: 0 };
       }
-      counselorMap[c.counselor_id][c.final_status] = parseInt(c.cnt, 10);
       if (c.final_status === 'enrolled') {
+        counselorMap[c.counselor_id].enrolled = parseInt(c.cnt, 10);
         counselorMap[c.counselor_id].revenue = parseFloat(c.total_revenue || 0);
+      } else if (c.final_status === 'lost') {
+        counselorMap[c.counselor_id].lost = parseInt(c.cnt, 10);
       }
     });
 
@@ -2226,11 +2981,23 @@ app.get('/api/reports/source-breakdown', authenticateToken, requireRole(['super_
 // Daily upload trend (last 14 days)
 app.get('/api/reports/upload-trend', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
   try {
-    const trend = await db('upload_batches')
-      .whereRaw(`upload_date >= date('now', '-14 days')`)
-      .groupByRaw(`date(upload_date)`)
-      .select(db.raw(`date(upload_date) as date, SUM(total_rows) as total, SUM(clean_rows) as clean`))
-      .orderBy('date', 'asc');
+    // Grouping done in JS (by IST calendar day, consistent with the rest of the app's
+    // date handling) rather than in SQL, since `date('now', '-14 days')`/`date(col)` are
+    // SQLite-only syntax and would throw on the production PostgreSQL database.
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    const rows = await db('upload_batches')
+      .where('upload_date', '>=', serializeDate(fourteenDaysAgo))
+      .select('upload_date', 'total_rows', 'clean_rows');
+
+    const byDate = {};
+    rows.forEach(r => {
+      const dateStr = getISTDateString(new Date(r.upload_date));
+      if (!byDate[dateStr]) byDate[dateStr] = { date: dateStr, total: 0, clean: 0 };
+      byDate[dateStr].total += Number(r.total_rows) || 0;
+      byDate[dateStr].clean += Number(r.clean_rows) || 0;
+    });
+
+    const trend = Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
     res.json(trend);
   } catch (err) {
     console.error(err);
@@ -2245,8 +3012,9 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
     return res.status(400).json({ error: 'start_date and end_date are required' });
   }
 
-  const start = new Date(`${start_date}T00:00:00.000Z`);
-  const end = new Date(`${end_date}T23:59:59.999Z`);
+  // IST calendar dates (as picked in the UI), not UTC — see getISTDayRange.
+  const start = getISTDayRange(start_date).start;
+  const end = getISTDayRange(end_date).end;
 
   try {
     // 1. Batches uploaded in this range
@@ -2254,16 +3022,16 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
     if (req.user.role !== 'team_leader') {
       batches = await db('upload_batches')
         .leftJoin('users', 'upload_batches.uploaded_by', 'users.id')
-        .where('upload_batches.upload_date', '>=', start)
-        .where('upload_batches.upload_date', '<=', end)
+        .where('upload_batches.upload_date', '>=', serializeDate(start))
+        .where('upload_batches.upload_date', '<=', serializeDate(end))
         .select('upload_batches.*', 'users.name as uploader_name')
         .orderBy('upload_batches.upload_date', 'desc');
     }
 
     // 2. Summary stats for leads created in this range
     let leadsSummaryQuery = db('leads')
-      .where('leads.created_at', '>=', start)
-      .where('leads.created_at', '<=', end);
+      .where('leads.created_at', '>=', serializeDate(start))
+      .where('leads.created_at', '<=', serializeDate(end));
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
         return res.json({
@@ -2272,10 +3040,18 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
           counselors: []
         });
       }
+      // Filtering directly on a joined 'counselors.team_id' would turn this into an inner
+      // join and silently exclude every dropped lead (no current lead_assignments row) even
+      // though it belongs to this team via closures.counselor_id. Scope by team membership
+      // checked against either source of attribution instead.
+      const teamCounselorIds = db('users').where({ team_id: req.user.team_id, role: 'counselor' }).select('id');
       leadsSummaryQuery = leadsSummaryQuery
-        .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
-        .join('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
-        .where({ 'counselors.team_id': req.user.team_id });
+        .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
+        .leftJoin('closures', 'leads.id', 'closures.lead_id')
+        .where(function () {
+          this.whereIn('lead_assignments.counselor_id', teamCounselorIds)
+            .orWhereIn('closures.counselor_id', teamCounselorIds);
+        });
     }
 
     const leadsSummary = await leadsSummaryQuery
@@ -2296,23 +3072,30 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
     });
 
     // 3. Distribution & Assignment stats in this range
-    let distQuery = db('lead_assignments')
-      .where('lead_assignments.assigned_at', '>=', start)
-      .where('lead_assignments.assigned_at', '<=', end);
+    // Sourced from the permanent 'distributed' activity log entry, not the live
+    // lead_assignments row — that row gets deleted the moment a lead is later dropped
+    // OR enrolled, which would make "leads distributed in this range" shrink over time
+    // as leads get closed, even though the distribution itself is a historical fact that
+    // never changes. This was silently deflating total_distributed, which is exactly what
+    // let the enrolled/lost conversion rate (computed against this same denominator)
+    // read over 100% once enough previously-distributed leads had since closed.
+    let distQuery = db('lead_activity_log')
+      .join('users', 'lead_activity_log.counselor_id', 'users.id')
+      .where('lead_activity_log.action', 'distributed')
+      .where('lead_activity_log.timestamp', '>=', serializeDate(start))
+      .where('lead_activity_log.timestamp', '<=', serializeDate(end));
     if (req.user.role === 'team_leader') {
-      distQuery = distQuery
-        .join('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
-        .where({ 'counselors.team_id': req.user.team_id });
+      distQuery = distQuery.where({ 'users.team_id': req.user.team_id });
     }
 
     const distributedCount = await distQuery
-      .count('lead_assignments.id as count')
+      .count('lead_activity_log.id as count')
       .first();
 
     // 4. Closures summary in this range
     let closuresSumQuery = db('closures')
-      .where('closures.closed_at', '>=', start)
-      .where('closures.closed_at', '<=', end);
+      .where('closures.closed_at', '>=', serializeDate(start))
+      .where('closures.closed_at', '<=', serializeDate(end));
     if (req.user.role === 'team_leader') {
       closuresSumQuery = closuresSumQuery
         .whereIn('closures.counselor_id', db('users').where({ team_id: req.user.team_id }).select('id'));
@@ -2332,23 +3115,30 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
       if (c.final_status === 'enrolled') {
         enrolledCount = count;
         totalRevenue = parseFloat(c.total_revenue || 0);
-      } else if (c.final_status === 'lost') {
-        lostCount = count;
+        // 'lost'/'duplicate'/'job_seeker' are all counted together as "Drops" here —
+        // must match the per-counselor breakdown below (counselorClosures.forEach),
+        // which already combines all three under counselorMap[...].lost. Counting only
+        // 'lost' here made the summary card's Drops figure disagree with the sum of the
+        // per-counselor table's Lost/Dropped column whenever any Duplicate/Job Seeker
+        // closures fell in the date range.
+      } else if (c.final_status === 'lost' || c.final_status === 'duplicate' || c.final_status === 'job_seeker') {
+        lostCount += count;
       }
     });
 
     // 5. Counselor-wise allocation and conversions in this range
     let counselorAllocationsQuery = db('lead_assignments')
       .join('users', 'lead_assignments.counselor_id', 'users.id')
-      .where('lead_assignments.assigned_at', '>=', start)
-      .where('lead_assignments.assigned_at', '<=', end);
+      .where('lead_assignments.assigned_at', '>=', serializeDate(start))
+      .where('lead_assignments.assigned_at', '<=', serializeDate(end));
 
-    let counselorClosuresQuery = db('lead_activity_log')
-      .join('closures', 'lead_activity_log.lead_id', 'closures.lead_id')
-      .join('users', 'lead_activity_log.counselor_id', 'users.id')
-      .where({ 'lead_activity_log.action': 'tick' })
-      .where('closures.closed_at', '>=', start)
-      .where('closures.closed_at', '<=', end);
+    // Attribute closures directly via closures.counselor_id — a lead dropped straight
+    // from L1 never gets a 'tick' activity log, so joining through that log silently
+    // excluded those drops from this report even though they're real closures.
+    let counselorClosuresQuery = db('closures')
+      .join('users', 'closures.counselor_id', 'users.id')
+      .where('closures.closed_at', '>=', serializeDate(start))
+      .where('closures.closed_at', '<=', serializeDate(end));
 
     if (req.user.role === 'team_leader') {
       counselorAllocationsQuery = counselorAllocationsQuery.where({ 'users.team_id': req.user.team_id });
@@ -2356,31 +3146,36 @@ app.get('/api/reports/custom-timeline', authenticateToken, requireRole(['super_a
     }
 
     const counselorAllocations = await counselorAllocationsQuery
-      .groupBy('lead_assignments.counselor_id', 'users.name', 'lead_assignments.stage')
-      .select('lead_assignments.counselor_id', 'users.name as counselor_name', 'lead_assignments.stage')
+      .groupBy('lead_assignments.counselor_id', 'users.name', 'lead_assignments.counseling_status')
+      .select('lead_assignments.counselor_id', 'users.name as counselor_name', 'lead_assignments.counseling_status')
       .count('lead_assignments.id as cnt');
 
     const counselorClosures = await counselorClosuresQuery
-      .groupBy('lead_activity_log.counselor_id', 'users.name', 'closures.final_status')
-      .select('lead_activity_log.counselor_id', 'users.name as counselor_name', 'closures.final_status')
+      .groupBy('closures.counselor_id', 'users.name', 'closures.final_status')
+      .select('closures.counselor_id', 'users.name as counselor_name', 'closures.final_status')
       .count('closures.id as cnt')
       .sum('closures.revenue as total_revenue');
 
     const counselorMap = {};
+    const emptyCounts = () => ({ notContacted: 0, interested: 0, callBack: 0, cold: 0, notContactable: 0, leadPunched: 0, enrolled: 0, lost: 0, revenue: 0 });
+    const statusKeys = { 'Not Contacted': 'notContacted', 'Interested': 'interested', 'Call Back': 'callBack', 'Cold': 'cold', 'Not Contactable': 'notContactable', 'Lead Punched': 'leadPunched' };
     counselorAllocations.forEach(r => {
       if (!counselorMap[r.counselor_id]) {
-        counselorMap[r.counselor_id] = { id: r.counselor_id, name: r.counselor_name, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0, revenue: 0 };
+        counselorMap[r.counselor_id] = { id: r.counselor_id, name: r.counselor_name, ...emptyCounts() };
       }
-      counselorMap[r.counselor_id][r.stage] = parseInt(r.cnt, 10);
+      const key = statusKeys[r.counseling_status];
+      if (key) counselorMap[r.counselor_id][key] = parseInt(r.cnt, 10);
     });
 
     counselorClosures.forEach(c => {
       if (!counselorMap[c.counselor_id]) {
-        counselorMap[c.counselor_id] = { id: c.counselor_id, name: c.counselor_name, L1: 0, L2: 0, L3: 0, enrolled: 0, lost: 0, revenue: 0 };
+        counselorMap[c.counselor_id] = { id: c.counselor_id, name: c.counselor_name, ...emptyCounts() };
       }
-      counselorMap[c.counselor_id][c.final_status] = parseInt(c.cnt, 10);
       if (c.final_status === 'enrolled') {
+        counselorMap[c.counselor_id].enrolled = parseInt(c.cnt, 10);
         counselorMap[c.counselor_id].revenue = parseFloat(c.total_revenue || 0);
+      } else if (c.final_status === 'lost' || c.final_status === 'duplicate' || c.final_status === 'job_seeker') {
+        counselorMap[c.counselor_id].lost += parseInt(c.cnt, 10);
       }
     });
 
@@ -2412,43 +3207,59 @@ app.get('/api/reports/custom-timeline/leads', authenticateToken, requireRole(['s
     return res.status(400).json({ error: 'start_date and end_date are required' });
   }
 
-  const start = new Date(`${start_date}T00:00:00.000Z`);
-  const end = new Date(`${end_date}T23:59:59.999Z`);
+  // IST calendar dates (as picked in the UI), not UTC — see getISTDayRange.
+  const start = getISTDayRange(start_date).start;
+  const end = getISTDayRange(end_date).end;
 
   try {
+    // Counselor name falls back to closures.counselor_id — dropping a lead deletes its
+    // lead_assignments row, so relying on that join alone leaves every dropped lead's
+    // counselor blank here.
     let query = db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
       .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
       .leftJoin('upload_batches', 'leads.upload_batch_id', 'upload_batches.id')
-      .where('leads.created_at', '>=', start)
-      .where('leads.created_at', '<=', end);
+      .where('leads.created_at', '>=', serializeDate(start))
+      .where('leads.created_at', '<=', serializeDate(end));
 
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
         return res.json([]);
       }
-      query = query.where({ 'counselors.team_id': req.user.team_id });
+      // Filtering directly on 'counselors.team_id' would turn this into an inner join and
+      // exclude every dropped lead (no current assignment). Scope by team membership
+      // checked against either source of counselor attribution instead.
+      const teamCounselorIds = db('users').where({ team_id: req.user.team_id, role: 'counselor' }).select('id');
+      query = query.where(function () {
+        this.whereIn('lead_assignments.counselor_id', teamCounselorIds)
+          .orWhereIn('closures.counselor_id', teamCounselorIds);
+      });
     }
 
     query = query.select(
-        'leads.*',
-        'upload_batches.file_name as batch_name',
-        'lead_assignments.stage',
-        'lead_assignments.disposition',
-        'counselors.name as counselor_name',
-        'closures.final_status as closure_status',
-        'closures.revenue as closure_revenue',
-        'universities.name as university_name'
-      );
+      'leads.*',
+      'upload_batches.file_name as batch_name',
+      'lead_assignments.counseling_status',
+      'lead_assignments.not_contactable_reason',
+      'lead_assignments.status_remark',
+      'lead_assignments.registration_status',
+      'lead_assignments.fee_payment_status',
+      db.raw('COALESCE(counselors.name, closure_counselors.name) as counselor_name'),
+      'closures.final_status as closure_status',
+      'closures.revenue as closure_revenue',
+      'closures.drop_remark as closure_remark',
+      'universities.name as university_name'
+    );
 
     if (search) {
       const q = `%${search.toLowerCase()}%`;
-      query = query.where(function() {
+      query = query.where(function () {
         this.where(db.raw('LOWER(leads.name)'), 'like', q)
-            .orWhere(db.raw('LOWER(leads.phone)'), 'like', q)
-            .orWhere(db.raw('LOWER(leads.email)'), 'like', q);
+          .orWhere(db.raw('LOWER(leads.phone)'), 'like', q)
+          .orWhere(db.raw('LOWER(leads.email)'), 'like', q);
       });
     }
 
@@ -2467,18 +3278,23 @@ app.get('/api/reports/custom-timeline/export', authenticateToken, requireRole(['
     return res.status(400).json({ error: 'start_date and end_date are required' });
   }
 
-  const start = new Date(`${start_date}T00:00:00.000Z`);
-  const end = new Date(`${end_date}T23:59:59.999Z`);
+  // IST calendar dates (as picked in the UI), not UTC — see getISTDayRange.
+  const start = getISTDayRange(start_date).start;
+  const end = getISTDayRange(end_date).end;
 
   try {
+    // Assigned Counselor falls back to closures.counselor_id — dropping a lead deletes
+    // its lead_assignments row, so relying on that join alone leaves every dropped lead's
+    // counselor blank in the exported file.
     const leads = await db('leads')
       .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
       .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
       .leftJoin('upload_batches', 'leads.upload_batch_id', 'upload_batches.id')
-      .where('leads.created_at', '>=', start)
-      .where('leads.created_at', '<=', end)
+      .where('leads.created_at', '>=', serializeDate(start))
+      .where('leads.created_at', '<=', serializeDate(end))
       .select(
         'leads.name as Candidate Name',
         'leads.phone as Phone',
@@ -2493,8 +3309,8 @@ app.get('/api/reports/custom-timeline/export', authenticateToken, requireRole(['
         'universities.name as Interested University',
         'leads.source as Lead Source',
         'upload_batches.file_name as Upload Batch',
-        'counselors.name as Assigned Counselor',
-        'lead_assignments.stage as Pipeline Stage',
+        db.raw('COALESCE(counselors.name, closure_counselors.name) as "Assigned Counselor"'),
+        'lead_assignments.counseling_status as Counseling Status',
         'leads.status as Data Status',
         'closures.final_status as Closure Outcome',
         'closures.revenue as Revenue',
@@ -2502,8 +3318,21 @@ app.get('/api/reports/custom-timeline/export', authenticateToken, requireRole(['
       )
       .orderBy('leads.created_at', 'asc');
 
+    // Log the download event — every other export endpoint in this file does this
+    // (export/batch/:batchId, export/all); this one was silently missing it, leaving no
+    // audit trail for a custom-timeline export despite the PRD's "every export is logged"
+    // requirement.
+    await db('lead_activity_log').insert({
+      id: randomUUID(),
+      lead_id: null,
+      counselor_id: req.user.id,
+      action: 'download',
+      remark: `Downloaded custom timeline export: ${start_date} to ${end_date} (${leads.length} leads)`,
+      timestamp: new Date()
+    });
+
     const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.json_to_sheet(leads);
+    const ws = xlsx.utils.json_to_sheet(sanitizeForExport(leads));
     xlsx.utils.book_append_sheet(wb, ws, "Leads Timeline Report");
     const buf = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
@@ -2559,7 +3388,7 @@ app.get('/api/audit/logs', authenticateToken, requireRole(['super_admin']), asyn
     }
 
     if (start_date) {
-      query = query.where('lead_activity_log.timestamp', '>=', new Date(start_date));
+      query = query.where('lead_activity_log.timestamp', '>=', serializeDate(new Date(start_date)));
     }
 
     const logs = await query.orderBy('lead_activity_log.timestamp', 'desc').limit(200);
@@ -2586,11 +3415,15 @@ app.get('/api/vault/batches', authenticateToken, requireRole(['super_admin', 'ma
       .orderBy('upload_batches.upload_date', 'desc');
 
     if (date) {
-      // Filter by calendar day (date = YYYY-MM-DD)
-      batchQuery = batchQuery.whereRaw(
-        `DATE(upload_batches.upload_date) = ?`,
-        [date]
-      );
+      // Filter by IST calendar day (date = YYYY-MM-DD), via getISTDayRange like every other
+      // date-bounded report in this file. The previous `DATE(upload_batches.upload_date) = ?`
+      // read the UTC date on Postgres (wrong by up to 5.5h around IST midnight), and on SQLite
+      // treated the stored epoch-ms integer as a Julian day number (DATE() needs an
+      // `unixepoch` modifier for that), so the filter matched nothing at all in dev.
+      const { start, end } = getISTDayRange(date);
+      batchQuery = batchQuery
+        .where('upload_batches.upload_date', '>=', serializeDate(start))
+        .where('upload_batches.upload_date', '<=', serializeDate(end));
     }
 
     const batches = await batchQuery;
@@ -2601,12 +3434,12 @@ app.get('/api/vault/batches', authenticateToken, requireRole(['super_admin', 'ma
 
     const batchIds = batches.map(b => b.id);
 
-    // Stage counts per batch (L1/L2/L3) — join leads → lead_assignments
-    const stageCounts = await db('leads')
+    // Counseling status counts per batch — join leads → lead_assignments
+    const statusCounts = await db('leads')
       .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .whereIn('leads.upload_batch_id', batchIds)
-      .groupBy('leads.upload_batch_id', 'lead_assignments.stage')
-      .select('leads.upload_batch_id as batch_id', 'lead_assignments.stage')
+      .groupBy('leads.upload_batch_id', 'lead_assignments.counseling_status')
+      .select('leads.upload_batch_id as batch_id', 'lead_assignments.counseling_status')
       .count('lead_assignments.id as cnt');
 
     // Conversion summary per batch — enrolled / lost / revenue
@@ -2636,10 +3469,10 @@ app.get('/api/vault/batches', authenticateToken, requireRole(['super_admin', 'ma
       .count('leads.id as cnt');
 
     // Build lookup maps
-    const stageMap = {};
-    stageCounts.forEach(s => {
-      if (!stageMap[s.batch_id]) stageMap[s.batch_id] = { L1: 0, L2: 0, L3: 0 };
-      stageMap[s.batch_id][s.stage] = parseInt(s.cnt, 10);
+    const statusMap = {};
+    statusCounts.forEach(s => {
+      if (!statusMap[s.batch_id]) statusMap[s.batch_id] = {};
+      statusMap[s.batch_id][s.counseling_status] = parseInt(s.cnt, 10);
     });
 
     const convMap = {};
@@ -2663,11 +3496,14 @@ app.get('/api/vault/batches', authenticateToken, requireRole(['super_admin', 'ma
 
     // Merge into enriched response
     const enriched = batches.map(b => {
-      const remainingClean = unassignedMap[b.id] !== undefined ? unassignedMap[b.id] : b.clean_rows;
+      // Absence from unassignedMap means the GROUP BY found zero unassigned rows for this
+      // batch (i.e. every clean lead has already been distributed) - NOT that none were, so
+      // the fallback must be 0, never b.clean_rows.
+      const remainingClean = unassignedMap[b.id] !== undefined ? unassignedMap[b.id] : 0;
       const distributedClean = Math.max(0, b.clean_rows - remainingClean);
       return {
         ...b,
-        stages: stageMap[b.id] || { L1: 0, L2: 0, L3: 0 },
+        statuses: statusMap[b.id] || {},
         conversions: convMap[b.id] || { enrolled: 0, lost: 0, revenue: 0 },
         distribution_count: distMap[b.id] || 0,
         remaining_clean_count: remainingClean,
@@ -2727,35 +3563,34 @@ app.get('/api/vault/batches/:id', authenticateToken, requireRole(['super_admin',
     let counselorConversions = [];
 
     if (counselorIds.length > 0) {
-      // Stage breakdown per counselor for leads from this batch
+      // Counseling status breakdown per counselor for leads from this batch
       counselorStages = await db('leads')
         .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
         .where({ 'leads.upload_batch_id': batchId })
         .whereIn('lead_assignments.counselor_id', counselorIds)
-        .groupBy('lead_assignments.counselor_id', 'lead_assignments.stage')
-        .select('lead_assignments.counselor_id', 'lead_assignments.stage')
+        .groupBy('lead_assignments.counselor_id', 'lead_assignments.counseling_status')
+        .select('lead_assignments.counselor_id', 'lead_assignments.counseling_status')
         .count('lead_assignments.id as cnt');
 
-      // Conversion breakdown per counselor for leads from this batch
+      // Conversion breakdown per counselor for leads from this batch.
+      // Attribute via closures.counselor_id directly — a lead dropped straight from L1
+      // never gets a 'tick' activity log, so the old join through that log silently
+      // excluded those drops from this batch's per-counselor breakdown.
       counselorConversions = await db('leads')
         .join('closures', 'leads.id', 'closures.lead_id')
-        .join('lead_activity_log', function() {
-          this.on('lead_activity_log.lead_id', '=', 'leads.id')
-              .andOn('lead_activity_log.action', db.raw("'tick'"));
-        })
         .where({ 'leads.upload_batch_id': batchId })
-        .whereIn('lead_activity_log.counselor_id', counselorIds)
-        .groupBy('lead_activity_log.counselor_id', 'closures.final_status')
-        .select('lead_activity_log.counselor_id', 'closures.final_status')
+        .whereIn('closures.counselor_id', counselorIds)
+        .groupBy('closures.counselor_id', 'closures.final_status')
+        .select('closures.counselor_id', 'closures.final_status')
         .count('closures.id as cnt')
         .sum('closures.revenue as total_revenue');
     }
 
-    // Build stage map per counselor
+    // Build status map per counselor
     const counselorStageMap = {};
     counselorStages.forEach(s => {
-      if (!counselorStageMap[s.counselor_id]) counselorStageMap[s.counselor_id] = { L1: 0, L2: 0, L3: 0 };
-      counselorStageMap[s.counselor_id][s.stage] = parseInt(s.cnt, 10);
+      if (!counselorStageMap[s.counselor_id]) counselorStageMap[s.counselor_id] = {};
+      counselorStageMap[s.counselor_id][s.counseling_status] = parseInt(s.cnt, 10);
     });
 
     const counselorConvMap = {};
@@ -2771,7 +3606,7 @@ app.get('/api/vault/batches/:id', authenticateToken, requireRole(['super_admin',
     const enrichedAllocations = counselorAllocations.map(a => ({
       ...a,
       actual_lead_ids: undefined, // strip heavy field
-      stages: counselorStageMap[a.counselor_id] || { L1: 0, L2: 0, L3: 0 },
+      statuses: counselorStageMap[a.counselor_id] || {},
       conversions: counselorConvMap[a.counselor_id] || { enrolled: 0, lost: 0, revenue: 0 }
     }));
 
@@ -2817,6 +3652,17 @@ app.delete('/api/vault/batches/:id', authenticateToken, requireRole(['super_admi
         await trx('leads').whereIn('id', leadIds).delete();
       }
 
+      // Distribution history for this batch would otherwise be orphaned — the
+      // distribution_batches.source_batch_id FK is ON DELETE SET NULL, so without this
+      // it silently survives with source_batch_id=null and actual_lead_ids pointing at
+      // now-deleted leads, forever. Delete it explicitly so removing a batch also removes
+      // its full audit trail, consistent with everything else this endpoint cleans up.
+      const distBatchIds = await trx('distribution_batches').where({ source_batch_id: batchId }).select('id');
+      if (distBatchIds.length > 0) {
+        await trx('distribution_allocations').whereIn('distribution_batch_id', distBatchIds.map(d => d.id)).delete();
+        await trx('distribution_batches').whereIn('id', distBatchIds.map(d => d.id)).delete();
+      }
+
       // 3. Delete the batch itself
       await trx('upload_batches').where({ id: batchId }).delete();
 
@@ -2838,20 +3684,23 @@ app.delete('/api/vault/batches/:id', authenticateToken, requireRole(['super_admi
   }
 });
 
-// GET /api/vault/batches/:id/conversions — list of enrolled or lost leads from a batch
+// GET /api/vault/batches/:id/conversions — list of leads from a batch by terminal outcome
 app.get('/api/vault/batches/:id/conversions', authenticateToken, requireRole(['super_admin', 'manager']), async (req, res) => {
   const { id } = req.params;
-  const { status } = req.query; // 'enrolled' or 'lost'
-  
-  if (!status || (status !== 'enrolled' && status !== 'lost')) {
-    return res.status(400).json({ error: "Query parameter 'status' must be 'enrolled' or 'lost'" });
+  const { status } = req.query; // 'enrolled' | 'lost' | 'duplicate' | 'job_seeker'
+  const VALID_TERMINAL_STATUSES = ['enrolled', 'lost', 'duplicate', 'job_seeker'];
+
+  if (!status || !VALID_TERMINAL_STATUSES.includes(status)) {
+    return res.status(400).json({ error: `Query parameter 'status' must be one of: ${VALID_TERMINAL_STATUSES.join(', ')}` });
   }
-  
+
   try {
+    // Attribute via closures.counselor_id directly, not lead_assignments — dropping a
+    // lead deletes its lead_assignments row, so every 'lost' lead here would otherwise
+    // show a blank counselor name (the join would find nothing to match against).
     const leads = await db('leads')
       .join('closures', 'leads.id', 'closures.lead_id')
-      .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
-      .leftJoin('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
+      .leftJoin('users as counselors', 'closures.counselor_id', 'counselors.id')
       .leftJoin('universities', 'closures.university_id', 'universities.id')
       .where({ 'leads.upload_batch_id': id, 'closures.final_status': status })
       .select(
@@ -2863,7 +3712,7 @@ app.get('/api/vault/batches/:id/conversions', authenticateToken, requireRole(['s
         'universities.name as university_name'
       )
       .orderBy('leads.name', 'asc');
-      
+
     res.json(leads);
   } catch (err) {
     console.error(err);
@@ -2875,12 +3724,36 @@ app.get('/api/vault/batches/:id/conversions', authenticateToken, requireRole(['s
 app.get('/api/vault/batches/:batchId/counselors/:counselorId/leads', authenticateToken, requireRole(['super_admin', 'manager']), async (req, res) => {
   const { batchId, counselorId } = req.params;
   try {
-    const leads = await db('leads')
+    // Currently active leads (still assigned to this counselor).
+    const activeLeads = await db('leads')
       .join('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
       .leftJoin('universities', 'leads.university_id', 'universities.id')
       .where({ 'leads.upload_batch_id': batchId, 'lead_assignments.counselor_id': counselorId })
-      .select('leads.*', 'lead_assignments.stage', 'lead_assignments.disposition', 'lead_assignments.updated_at as assigned_updated_at', 'universities.name as university_name')
-      .orderBy('leads.name', 'asc');
+      .select('leads.*', 'lead_assignments.counseling_status', 'lead_assignments.status_remark', 'lead_assignments.registration_status', 'lead_assignments.fee_payment_status', 'lead_assignments.updated_at as assigned_updated_at', 'universities.name as university_name');
+
+    // Leads this counselor closed out (terminal statuses) — closing deletes the
+    // lead_assignments row, so these would otherwise vanish from this drill-down
+    // entirely even though the counselor worked them. Attribute via closures.counselor_id,
+    // the only durable record left. whereNull('lead_assignments.id') guards against
+    // double-listing anything that somehow still has an active assignment (e.g.
+    // reassigned after being closed once).
+    const droppedLeads = await db('leads')
+      .join('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
+      .leftJoin('universities', 'leads.university_id', 'universities.id')
+      .where({ 'leads.upload_batch_id': batchId, 'closures.counselor_id': counselorId })
+      .whereIn('closures.final_status', ['lost', 'duplicate', 'job_seeker'])
+      .whereNull('lead_assignments.id')
+      .select(
+        'leads.*',
+        'closures.final_status',
+        db.raw("closures.final_status as counseling_status"),
+        'closures.drop_remark as status_remark',
+        'closures.closed_at as assigned_updated_at',
+        'universities.name as university_name'
+      );
+
+    const leads = [...activeLeads, ...droppedLeads].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
     res.json(leads);
   } catch (err) {
     console.error(err);
@@ -2895,7 +3768,7 @@ app.get('/api/manager/leads/dropped', authenticateToken, requireRole(['super_adm
       .join('closures', 'leads.id', 'closures.lead_id')
       .leftJoin('users', 'closures.counselor_id', 'users.id')
       .leftJoin('universities', 'closures.university_id', 'universities.id')
-      .where({ 'closures.final_status': 'lost' });
+      .whereIn('closures.final_status', ['lost', 'duplicate', 'job_seeker']);
 
     if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
@@ -2909,6 +3782,7 @@ app.get('/api/manager/leads/dropped', authenticateToken, requireRole(['super_adm
         'leads.*',
         'closures.drop_stage',
         'closures.drop_remark',
+        'closures.final_status',
         'closures.closed_at',
         'users.name as counselor_name',
         'universities.name as university_name'
@@ -2922,7 +3796,7 @@ app.get('/api/manager/leads/dropped', authenticateToken, requireRole(['super_adm
   }
 });
 
-// GET /api/manager/leads/decompositions - get full stage decompositions and journey mapping
+// GET /api/manager/leads/decompositions - get each lead's status-change journey
 app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
   const { startDate, endDate } = req.query;
 
@@ -2935,7 +3809,8 @@ app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['su
     let logQuery = db('lead_activity_log')
       .join('users', 'lead_activity_log.counselor_id', 'users.id')
       .whereBetween('lead_activity_log.timestamp', [start, end])
-      .whereNotNull('lead_activity_log.lead_id');
+      .whereNotNull('lead_activity_log.lead_id')
+      .whereIn('lead_activity_log.action', ['status_change', 'registration_update', 'fee_update', 'tick', 'cross']);
 
     // If Team Leader, filter activity logs by team counselors
     if (req.user.role === 'team_leader') {
@@ -2965,7 +3840,6 @@ app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['su
       .select(
         'leads.*',
         'closures.revenue as closure_revenue',
-        'closures.documents_status as documents_status',
         'closures.closed_at',
         'closures.final_status',
         'closures.drop_stage',
@@ -2978,7 +3852,8 @@ app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['su
       leadsMap[l.id] = l;
     });
 
-    // 4. Process journeys chronologically
+    // 4. Process journeys chronologically — every milestone here is read directly off a
+    // known log action/prefix, no remark-text guessing.
     const leadJourneys = {};
     logs.forEach(log => {
       const leadId = log.lead_id;
@@ -3000,55 +3875,24 @@ app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['su
           final_status: lead.final_status,
           drop_stage: lead.drop_stage,
           drop_remark: lead.drop_remark,
-          documents_status: lead.documents_status,
-          l1: null,
-          l2: null,
-          l3_reg: null,
-          l3_docs: null,
-          l3_fees: null
+          statusChange: null,
+          registered: null,
+          feeUpdate: null,
+          finalOutcome: null
         };
       }
 
       const journey = leadJourneys[leadId];
-      const remarkLower = (log.remark || '').toLowerCase();
+      const milestone = { date: log.timestamp, counselor: log.counselor_name, remark: log.remark };
 
-      // Map activities to journey milestones using flexible matchers
-      if (log.action === 'tick' && (remarkLower.includes('qualified') || remarkLower.includes('l2 active'))) {
-        journey.l1 = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: log.remark
-        };
-      } else if (log.action === 'tick' && (remarkLower.includes('punched') || remarkLower.includes('advanced to l3'))) {
-        journey.l2 = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: log.remark
-        };
-      } else if (remarkLower.includes('registration number') || remarkLower.includes('registered') || remarkLower.includes('registration')) {
-        journey.l3_reg = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: log.remark
-        };
-      } else if (remarkLower.includes('verification documents') || remarkLower.includes('documents verified') || remarkLower.includes('checklist')) {
-        journey.l3_docs = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: log.remark
-        };
-      } else if (log.action === 'tick' && (remarkLower.includes('successfully closed') || remarkLower.includes('enrolled') || remarkLower.includes('closed deal'))) {
-        journey.l3_fees = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: log.remark
-        };
-      } else if (log.action === 'cross' || remarkLower.includes('dropped') || remarkLower.includes('lost')) {
-        journey.l3_fees = {
-          date: log.timestamp,
-          counselor: log.counselor_name,
-          remark: 'Lead Dropped/Lost: ' + log.remark
-        };
+      if (log.action === 'status_change') {
+        journey.statusChange = milestone;
+      } else if (log.action === 'registration_update') {
+        journey.registered = milestone;
+      } else if (log.action === 'fee_update') {
+        journey.feeUpdate = milestone;
+      } else if (log.action === 'tick' || log.action === 'cross') {
+        journey.finalOutcome = milestone;
       }
     });
 
@@ -3062,13 +3906,21 @@ app.get('/api/manager/leads/decompositions', authenticateToken, requireRole(['su
 
 // --- LEAD FORWARDING TO MANAGER ---
 
+// Fixed set of escalation categories so Team Leader/Manager reporting can filter and
+// group escalations by root cause instead of parsing free-text remarks.
+const ESCALATION_CATEGORIES = ['Finance Issue', 'Time Constraint', 'Decision Delay', 'Placement Concern', 'Other'];
+
 // POST /api/counselor/leads/:id/forward - Counselor forwards lead to manager
 app.post('/api/counselor/leads/:id/forward', authenticateToken, requireRole(['counselor']), async (req, res) => {
   const leadId = req.params.id;
-  const { remark } = req.body;
+  const { remark, category } = req.body;
 
   if (!remark) {
     return res.status(400).json({ error: 'Remark is required to forward lead to manager.' });
+  }
+
+  if (!category || !ESCALATION_CATEGORIES.includes(category)) {
+    return res.status(400).json({ error: `A valid escalation category is required. Must be one of: ${ESCALATION_CATEGORIES.join(', ')}` });
   }
 
   try {
@@ -3083,12 +3935,13 @@ app.post('/api/counselor/leads/:id/forward', authenticateToken, requireRole(['co
       await trx('lead_assignments').where({ lead_id: leadId }).update({
         is_forwarded: true,
         forward_remark: remark,
+        escalation_category: category,
         forwarded_at: new Date(),
         updated_at: new Date()
       });
 
       // 3. Log activity
-      await logActivity(trx, leadId, req.user.id, 'forward_to_manager', `Forwarded to manager. Reason: ${remark}`);
+      await logActivity(trx, leadId, req.user.id, 'forward_to_manager', `Forwarded to manager. Category: ${category}. Reason: ${remark}`);
     });
 
     res.json({ message: 'Lead forwarded to manager successfully.' });
@@ -3116,10 +3969,13 @@ app.get('/api/manager/leads/forwarded', authenticateToken, requireRole(['super_a
     const forwardedLeads = await query
       .select(
         'leads.*',
-        'lead_assignments.stage',
-        'lead_assignments.disposition',
+        'lead_assignments.counseling_status',
+        'lead_assignments.status_remark',
+        'lead_assignments.registration_status',
+        'lead_assignments.fee_payment_status',
         'lead_assignments.forward_remark',
         'lead_assignments.forwarded_at',
+        'lead_assignments.escalation_category',
         'users.name as counselor_name',
         'users.id as counselor_id'
       )
@@ -3160,11 +4016,17 @@ app.post('/api/manager/leads/:id/resolve-forward', authenticateToken, requireRol
       }
 
       if (action === 'send_back') {
-        // Send back to the original counselor: clear forwarded flag
+        // Send back to the original counselor: clear forwarded flag. Record the resolution
+        // separately (escalation_resolved_at/type/note) so the counselor's dashboard can
+        // surface "this came back from your manager" — is_forwarded/forward_remark only
+        // capture that a lead IS currently escalated, not that it recently WAS.
         await trx('lead_assignments').where({ lead_id: leadId }).update({
           is_forwarded: false,
           forward_remark: null,
           forwarded_at: null,
+          escalation_resolved_at: new Date(),
+          escalation_resolution_type: 'send_back',
+          escalation_resolution_note: managerRemark || null,
           updated_at: new Date()
         });
 
@@ -3182,14 +4044,27 @@ app.post('/api/manager/leads/:id/resolve-forward', authenticateToken, requireRol
           }
         }
 
-        // Reassign to target counselor and clear forwarded flag
+        // Reassign to target counselor and clear forwarded flag. Bump assigned_at to now
+        // so the new counselor sees this as their Fresh Base today (matching how the
+        // separate transfer-request approval path already reassigns leads).
         await trx('lead_assignments').where({ lead_id: leadId }).update({
           counselor_id: targetCounselorId,
+          assigned_at: new Date(),
           is_forwarded: false,
           forward_remark: null,
           forwarded_at: null,
+          escalation_resolved_at: new Date(),
+          escalation_resolution_type: 'reassign',
+          escalation_resolution_note: managerRemark || null,
           updated_at: new Date()
         });
+
+        // Carry any still-open follow-up over to the new owner — see the identical fix
+        // in /api/transfers/resolve/:id for why leaving it under the old counselor_id
+        // makes it invisible to the new owner while still "due" for the old one.
+        await trx('follow_ups')
+          .where({ lead_id: leadId, counselor_id: assignment.counselor_id, completed: false })
+          .update({ counselor_id: targetCounselorId });
 
         await logActivity(trx, leadId, req.user.id, 'forward_resolved_reassign', `Reassigned by manager. Manager note: ${managerRemark || 'None'}`);
       }
@@ -3211,11 +4086,11 @@ app.post('/api/manager/leads/:id/resolve-forward', authenticateToken, requireRol
 // Counselor: sees only their own assigned leads
 app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 'counselor', 'super_admin', 'team_leader']), async (req, res) => {
   const { date } = req.query;
-  const targetDate = date || new Date().toISOString().slice(0, 10); // default today
+  const targetDate = date || getISTDateString(); // default today (IST calendar date)
 
-  // Build date window: start of day to end of day (UTC)
-  const dayStart = new Date(`${targetDate}T00:00:00.000Z`);
-  const dayEnd   = new Date(`${targetDate}T23:59:59.999Z`);
+  // Build date window: start of day to end of day, IST (the business's actual timezone —
+  // see getPeriodRange/getISTDayRange for why a plain Z-suffixed UTC boundary is wrong here)
+  const { start: dayStart, end: dayEnd } = getISTDayRange(targetDate);
 
   try {
     // Base query: all leads with assignment info
@@ -3241,8 +4116,11 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
         'leads.updated_at',
         'leads.university_id',
         'universities.name as university_name',
-        'lead_assignments.stage',
-        'lead_assignments.disposition',
+        'lead_assignments.counseling_status',
+        'lead_assignments.not_contactable_reason',
+        'lead_assignments.status_remark',
+        'lead_assignments.registration_status',
+        'lead_assignments.fee_payment_status',
         'lead_assignments.assigned_at',
         'lead_assignments.updated_at as assignment_updated_at',
         'counselor_user.name as counselor_name',
@@ -3255,8 +4133,10 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
     } else if (req.user.role === 'team_leader') {
       if (!req.user.team_id) {
         return res.json({
-          L1: [], L2: [], L3: [], interested: [], enrolled: [], dropped: [],
-          not_interested: [], not_picked_up: [], switched_off: [], all: []
+          date: targetDate,
+          summary: { total: 0, notContacted: 0, interested: 0, callBack: 0, cold: 0, notContactable: 0, leadPunched: 0, enrolled: 0, dropped: 0 },
+          cfProgress: { openingCF: 0, freshBase: 0, cfAhead: 0, cfPending: 0, cfClosedToday: 0, cfOriginalTotal: 0 },
+          categories: { notContacted: [], interested: [], callBack: [], cold: [], notContactable: [], leadPunched: [], enrolled: [], dropped: [], all: [] }
         });
       }
       query = query.where('counselor_user.team_id', req.user.team_id);
@@ -3272,8 +4152,13 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
     if (leadIds.length > 0) {
       let logQuery = db('lead_activity_log')
         .whereIn('lead_id', leadIds)
-        .where('timestamp', '>=', dayStart)
-        .where('timestamp', '<=', dayEnd)
+        // Exclude 'distributed' — auto-logged the moment a lead is allocated, not an actual
+        // counselor touch (see the identical exclusion + rationale in computeDataReport
+        // above). Without it, every freshly-distributed lead showed touchedToday: true
+        // before the counselor had done anything with it.
+        .whereNot('action', 'distributed')
+        .where('timestamp', '>=', serializeDate(dayStart))
+        .where('timestamp', '<=', serializeDate(dayEnd))
         .select('lead_id', 'action', 'remark', 'timestamp');
 
       if (req.user.role === 'counselor') {
@@ -3292,23 +4177,23 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
       return createdOnDate || assignmentUpdatedOnDate || hasActivityOnDate;
     });
 
-    // Categorize each lead
+    // Categorize each lead by its flat counseling status
     const categorized = {
-      L1: [],
-      L2: [],
-      L3: [],
+      notContacted: [],
       interested: [],
+      callBack: [],
+      cold: [],
+      notContactable: [],
+      leadPunched: [],
       enrolled: [],
       dropped: [],
-      not_interested: [],
-      not_picked_up: [],
-      switched_off: [],
       all: []
     };
 
     filtered.forEach(lead => {
       const entry = {
         ...lead,
+        touchedToday: activeLeadIds.has(lead.id),
         activity_today: activityLogs.filter(a => a.lead_id === lead.id)
       };
       categorized.all.push(entry);
@@ -3319,24 +4204,33 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
         return;
       }
 
-      // Active pipeline
-      if (lead.stage === 'L1') categorized.L1.push(entry);
-      else if (lead.stage === 'L2') categorized.L2.push(entry);
-      else if (lead.stage === 'L3') categorized.L3.push(entry);
-
-      // Disposition buckets
-      if (lead.disposition === 'Interested') categorized.interested.push(entry);
-      else if (lead.disposition === 'Not Interested') categorized.not_interested.push(entry);
-      else if (lead.disposition === 'Not Picked Up') categorized.not_picked_up.push(entry);
-      else if (lead.disposition === 'Switched Off') categorized.switched_off.push(entry);
+      if (lead.counseling_status === 'Not Contacted') categorized.notContacted.push(entry);
+      else if (lead.counseling_status === 'Interested') categorized.interested.push(entry);
+      else if (lead.counseling_status === 'Call Back') categorized.callBack.push(entry);
+      else if (lead.counseling_status === 'Cold') categorized.cold.push(entry);
+      else if (lead.counseling_status === 'Not Contactable') categorized.notContactable.push(entry);
+      else if (lead.counseling_status === 'Lead Punched') categorized.leadPunched.push(entry);
     });
 
-    // Also fetch closures for enrolled on date
-    const closures = await db('closures')
-      .whereIn('lead_id', leadIds)
+    // Also fetch closures for enrolled on date. Scoped directly via closures.counselor_id /
+    // team_id — NOT via whereIn('lead_id', leadIds) — because enrolling deletes the
+    // lead_assignments row the same way dropping does (see the terminal path in
+    // /api/counselor/leads/:id/status), so an enrolled lead's id is never actually in
+    // leadIds; scoping through it would silently return zero enrolled leads for every role,
+    // on every date.
+    // whereNull('lead_assignments.id') guards against double-listing a lead that was closed
+    // today and then reassigned/reopened later the same day — without it, such a lead would
+    // count here AND in `leads`/`filtered` above (which reflects its current, reopened
+    // assignment), double-counting it in any KPI that combines both (e.g. the counselor
+    // dashboard's "Assigned Today"/"Processed Today" cards). Mirrors the identical guard on
+    // GET /api/vault/batches/:batchId/counselors/:counselorId/leads.
+    let enrolledQuery = db('closures')
+      .join('users as enroll_counselor', 'closures.counselor_id', 'enroll_counselor.id')
+      .leftJoin('lead_assignments', 'closures.lead_id', 'lead_assignments.lead_id')
+      .whereNull('lead_assignments.id')
       .where('final_status', 'enrolled')
-      .where('closed_at', '>=', dayStart)
-      .where('closed_at', '<=', dayEnd)
+      .where('closed_at', '>=', serializeDate(dayStart))
+      .where('closed_at', '<=', serializeDate(dayEnd))
       .join('leads', 'closures.lead_id', 'leads.id')
       .leftJoin('universities', 'closures.university_id', 'universities.id')
       .select(
@@ -3350,24 +4244,136 @@ app.get('/api/leads/daily-tracking', authenticateToken, requireRole(['manager', 
         'closures.final_status',
         'closures.revenue',
         'closures.closed_at',
+        'closures.assignment_assigned_at',
         'universities.name as university_name'
       );
 
+    if (req.user.role === 'counselor') {
+      enrolledQuery = enrolledQuery.where('closures.counselor_id', req.user.id);
+    } else if (req.user.role === 'team_leader') {
+      enrolledQuery = enrolledQuery.where('enroll_counselor.team_id', req.user.team_id);
+    }
+
+    const closures = await enrolledQuery;
+
+    // Attach today's activity log so "Activity Today" isn't blank for freshly enrolled leads either.
+    if (closures.length > 0) {
+      const enrolledLeadIds = closures.map(l => l.id);
+      const enrolledActivityLogs = await db('lead_activity_log')
+        .whereIn('lead_id', enrolledLeadIds)
+        .where('timestamp', '>=', serializeDate(dayStart))
+        .where('timestamp', '<=', serializeDate(dayEnd))
+        .select('lead_id', 'action', 'remark', 'timestamp');
+
+      closures.forEach(lead => {
+        lead.activity_today = enrolledActivityLogs.filter(a => a.lead_id === lead.id);
+      });
+    }
+
     categorized.enrolled = closures;
+
+    // Also fetch closures for dropped/lost leads on date. Dropping a lead deletes its
+    // lead_assignments row (see /api/counselor/leads/:id/action, outcome 'cross'), so a
+    // freshly dropped lead never matches the INNER JOIN the main query above depends on —
+    // it would never surface here otherwise, no matter how recently it was dropped.
+    // closures is the source of truth for who dropped it and when, same as enrolled above.
+    let droppedQuery = db('closures')
+      .leftJoin('lead_assignments', 'closures.lead_id', 'lead_assignments.lead_id')
+      .whereNull('lead_assignments.id')
+      .whereIn('final_status', ['lost', 'duplicate', 'job_seeker'])
+      .where('closed_at', '>=', serializeDate(dayStart))
+      .where('closed_at', '<=', serializeDate(dayEnd))
+      .join('leads', 'closures.lead_id', 'leads.id')
+      .join('users as drop_counselor', 'closures.counselor_id', 'drop_counselor.id')
+      .leftJoin('universities', 'closures.university_id', 'universities.id')
+      .select(
+        'leads.id',
+        'leads.name',
+        'leads.phone',
+        'leads.email',
+        'leads.city',
+        'leads.state',
+        'leads.course_interest',
+        'closures.final_status',
+        'closures.drop_stage',
+        'closures.drop_remark',
+        'closures.closed_at',
+        'closures.assignment_assigned_at',
+        'drop_counselor.id as counselor_id',
+        'drop_counselor.name as counselor_name',
+        'universities.name as university_name'
+      );
+
+    if (req.user.role === 'counselor') {
+      droppedQuery = droppedQuery.where('closures.counselor_id', req.user.id);
+    } else if (req.user.role === 'team_leader') {
+      droppedQuery = droppedQuery.where('drop_counselor.team_id', req.user.team_id);
+    }
+
+    const droppedLeadsResult = await droppedQuery;
+
+    // Attach today's activity log (e.g. the drop remark itself) so the "Activity Today"
+    // column isn't blank for leads that were dropped today — same enrichment the leads
+    // in `filtered` already get above.
+    if (droppedLeadsResult.length > 0) {
+      const droppedLeadIds = droppedLeadsResult.map(l => l.id);
+      const droppedActivityLogs = await db('lead_activity_log')
+        .whereIn('lead_id', droppedLeadIds)
+        .where('timestamp', '>=', serializeDate(dayStart))
+        .where('timestamp', '<=', serializeDate(dayEnd))
+        .select('lead_id', 'action', 'remark', 'timestamp');
+
+      droppedLeadsResult.forEach(lead => {
+        lead.activity_today = droppedActivityLogs.filter(a => a.lead_id === lead.id);
+      });
+    }
+
+    categorized.dropped = droppedLeadsResult;
+
+    // Carry Forward progress for the selected date: of the leads already assigned before
+    // that day started, how many have moved off Not Contacted — "ahead" — vs how many are
+    // still sitting untouched — "pending". Leads that closed out entirely that day
+    // (enrolled/dropped) have no lead_assignments row left to classify by counseling_status,
+    // so they're counted as "ahead" via cfClosedToday, using the assignment_assigned_at
+    // snapshot taken at closure time (null for closures written before that field existed).
+    let cfOpen = 0, cfPending = 0, cfAhead = 0, freshOpen = 0;
+    leads.forEach(lead => {
+      const assignedAt = new Date(lead.assigned_at);
+      if (assignedAt < dayStart) {
+        cfOpen += 1;
+        if (lead.counseling_status === 'Not Contacted') cfPending += 1;
+        else cfAhead += 1;
+      } else if (assignedAt >= dayStart && assignedAt <= dayEnd) {
+        freshOpen += 1;
+      }
+    });
+    const cfClosedToday = [...categorized.enrolled, ...categorized.dropped]
+      .filter(l => l.assignment_assigned_at && new Date(l.assignment_assigned_at) < dayStart)
+      .length;
 
     res.json({
       date: targetDate,
       summary: {
-        total: filtered.length,
-        L1: categorized.L1.length,
-        L2: categorized.L2.length,
-        L3: categorized.L3.length,
+        // filtered.length never includes dropped leads (their assignment row is gone by
+        // the time we query), so add the dropped count back in — otherwise today's
+        // "total handled" figure silently undercounts every lead that got dropped today.
+        total: filtered.length + categorized.dropped.length,
+        notContacted: categorized.notContacted.length,
         interested: categorized.interested.length,
+        callBack: categorized.callBack.length,
+        cold: categorized.cold.length,
+        notContactable: categorized.notContactable.length,
+        leadPunched: categorized.leadPunched.length,
         enrolled: categorized.enrolled.length,
-        dropped: categorized.dropped.length,
-        not_interested: categorized.not_interested.length,
-        not_picked_up: categorized.not_picked_up.length,
-        switched_off: categorized.switched_off.length
+        dropped: categorized.dropped.length
+      },
+      cfProgress: {
+        openingCF: cfOpen,
+        freshBase: freshOpen,
+        cfAhead,
+        cfPending,
+        cfClosedToday,
+        cfOriginalTotal: cfOpen + cfClosedToday
       },
       categories: categorized
     });
@@ -3399,19 +4405,19 @@ app.get('/api/logs/counselor-activity', authenticateToken, requireRole(['manager
     }
 
     query = query.select(
-        'log.id',
-        'log.action',
-        'log.remark',
-        'log.timestamp',
-        'log.lead_id',
-        'u.id as counselor_id',
-        'u.name as counselor_name',
-        'u.company_email as counselor_email',
-        'l.name as lead_name',
-        'l.phone as lead_phone',
-        'l.city as lead_city',
-        'l.course_interest as lead_course'
-      )
+      'log.id',
+      'log.action',
+      'log.remark',
+      'log.timestamp',
+      'log.lead_id',
+      'u.id as counselor_id',
+      'u.name as counselor_name',
+      'u.company_email as counselor_email',
+      'l.name as lead_name',
+      'l.phone as lead_phone',
+      'l.city as lead_city',
+      'l.course_interest as lead_course'
+    )
       .orderBy('log.timestamp', 'desc')
       .limit(1000);
 
@@ -3422,18 +4428,18 @@ app.get('/api/logs/counselor-activity', authenticateToken, requireRole(['manager
       query = query.where('log.action', action_type);
     }
     if (date_from) {
-      query = query.where('log.timestamp', '>=', new Date(`${date_from}T00:00:00.000Z`));
+      query = query.where('log.timestamp', '>=', serializeDate(getISTDayRange(date_from).start));
     }
     if (date_to) {
-      query = query.where('log.timestamp', '<=', new Date(`${date_to}T23:59:59.999Z`));
+      query = query.where('log.timestamp', '<=', serializeDate(getISTDayRange(date_to).end));
     }
     if (search) {
       const q = `%${search.toLowerCase()}%`;
-      query = query.where(function() {
+      query = query.where(function () {
         this.where(db.raw('LOWER(u.name)'), 'like', q)
-            .orWhere(db.raw('LOWER(log.remark)'), 'like', q)
-            .orWhere(db.raw('LOWER(l.name)'), 'like', q)
-            .orWhere(db.raw('LOWER(l.phone)'), 'like', q);
+          .orWhere(db.raw('LOWER(log.remark)'), 'like', q)
+          .orWhere(db.raw('LOWER(l.name)'), 'like', q)
+          .orWhere(db.raw('LOWER(l.phone)'), 'like', q);
       });
     }
 
@@ -3445,6 +4451,25 @@ app.get('/api/logs/counselor-activity', authenticateToken, requireRole(['manager
   }
 });
 
+
+// --- HIRING WORKSPACE (Phase 1) ---
+// Fully isolated second workspace — its own tables (hiring_candidates, hiring_candidate_
+// assignments, hiring_closures, hiring_interviews, hiring_follow_ups, hiring_transfer_
+// requests, hiring_activity_log, hiring_teams, companies), its own roles (recruiter,
+// hiring_team_leader), no shared data with anything above this line.
+app.use('/api/hiring', authenticateToken, hiringRouter);
+
+// --- SERVE BUILT FRONTEND (optional) ---
+// Lets a single Node process serve the whole app (API + built React UI) for
+// environments without a separate nginx/static host in front, e.g. sharing this
+// server over a tunnel for internal testing. No-op if frontend/dist wasn't built.
+const frontendDist = path.join(__dirname, '../../frontend/dist');
+app.use(express.static(frontendDist));
+app.get(/^\/(?!api).*/, (req, res, next) => {
+  res.sendFile(path.join(frontendDist, 'index.html'), (err) => {
+    if (err) next();
+  });
+});
 
 // --- SERVER INITIALIZATION ---
 
@@ -3462,3 +4487,4 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Backend API Server running on port ${PORT}`);
 });
+

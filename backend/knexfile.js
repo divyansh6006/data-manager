@@ -9,7 +9,15 @@ module.exports = {
     useNullAsDefault: true,
     pool: {
       afterCreate: (conn, cb) => {
-        conn.run('PRAGMA foreign_keys = ON', cb);
+        conn.run('PRAGMA foreign_keys = ON', (err) => {
+          if (err) return cb(err, conn);
+          // WAL keeps writes crash-safe and lets reads continue during a write,
+          // which matters when several people are hitting the shared test DB at once.
+          conn.run('PRAGMA journal_mode = WAL', (err2) => {
+            if (err2) return cb(err2, conn);
+            conn.run('PRAGMA synchronous = FULL', cb);
+          });
+        });
       }
     },
     migrations: {

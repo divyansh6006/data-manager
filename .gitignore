@@ -9,8 +9,10 @@ node-bin/
 .env.local
 *.env.production
 
-# Dev database
-backend/dev.sqlite3
+# Dev database (all sqlite artifacts: main db, WAL/SHM journals, and any backup copies)
+*.sqlite3*
+backend/backups/
+backend/pre_recovery_broken_state_backup/
 
 # Build output
 frontend/dist/

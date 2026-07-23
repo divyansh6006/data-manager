@@ -38,6 +38,8 @@ export default function LoginView({ onLoginSuccess }) {
   }, []);
 
   const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [conflict, setConflict] = useState(null);
@@ -52,16 +54,17 @@ export default function LoginView({ onLoginSuccess }) {
     if (e) e.preventDefault();
     setError(null); setLoading(true);
     if (!email) { setError('Please enter your email.'); setLoading(false); return; }
-    if (!email.toLowerCase().endsWith('@company.com')) {
-      setError('Access restricted: Only @company.com accounts are permitted.');
+    if (!email.toLowerCase().endsWith('@skilllabs.net')) {
+      setError('Access restricted: Only @skilllabs.net accounts are permitted.');
       setLoading(false); return;
     }
+    if (!password) { setError('Please enter your password.'); setLoading(false); return; }
     const deviceId = generateDeviceId();
     try {
       const response = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim().toLowerCase(), deviceId, force })
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password, deviceId, force })
       });
       const data = await response.json();
       if (response.status === 409) { setConflict({ email, deviceId }); setLoading(false); return; }
@@ -127,7 +130,7 @@ export default function LoginView({ onLoginSuccess }) {
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="username@company.com"
+                  placeholder="username@skilllabs.net"
                   className="w-full pl-10 pr-4 py-2.5 rounded-lg text-sm text-white placeholder-slate-500"
                   style={{ background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', outline: 'none' }}
                   onFocus={e => e.target.style.borderColor = '#1BACE4'}
@@ -135,8 +138,38 @@ export default function LoginView({ onLoginSuccess }) {
                 />
               </div>
               <p className="text-[11px] text-slate-500 mt-2 font-body-sm">
-                * Restricted to <strong className="text-slate-400">@company.com</strong> accounts only
+                * Restricted to <strong className="text-slate-400">@skilllabs.net</strong> accounts only
               </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold uppercase tracking-wider text-slate-300 mb-2 font-label-caps">
+                Password
+              </label>
+              <div className="relative">
+                <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-400">
+                  <span className="material-symbols-outlined text-lg">lock</span>
+                </span>
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter your password"
+                  className="w-full pl-10 pr-10 py-2.5 rounded-lg text-sm text-white placeholder-slate-500"
+                  style={{ background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.15)', outline: 'none' }}
+                  onFocus={e => e.target.style.borderColor = '#1BACE4'}
+                  onBlur={e => e.target.style.borderColor = 'rgba(255,255,255,0.15)'}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(s => !s)}
+                  className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-slate-200"
+                  tabIndex={-1}
+                >
+                  <span className="material-symbols-outlined text-lg">{showPassword ? 'visibility_off' : 'visibility'}</span>
+                </button>
+              </div>
             </div>
 
             <button
@@ -150,29 +183,11 @@ export default function LoginView({ onLoginSuccess }) {
               ) : (
                 <>
                   <span className="material-symbols-outlined text-lg">login</span>
-                  <span>Sign in with Google Workspace</span>
+                  <span>Sign in</span>
                 </>
               )}
             </button>
           </form>
-
-          <div className="relative flex py-5 items-center">
-            <div className="flex-grow border-t" style={{ borderColor: 'rgba(255,255,255,0.1)' }}></div>
-            <span className="flex-shrink mx-4 text-[11px] text-slate-500 font-label-caps uppercase">or</span>
-            <div className="flex-grow border-t" style={{ borderColor: 'rgba(255,255,255,0.1)' }}></div>
-          </div>
-
-          <button
-            onClick={(e) => handleLogin(e, false)}
-            disabled={loading}
-            className="w-full flex items-center justify-center gap-2 py-2 px-4 text-slate-300 text-xs font-medium rounded-lg transition duration-200"
-            style={{ border: '1px solid rgba(255,255,255,0.12)' }}
-            onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.07)'}
-            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-          >
-            <span className="material-symbols-outlined text-lg" style={{ color: '#1BACE4' }}>cloud</span>
-            <span>Sign in with Microsoft 365</span>
-          </button>
         </div>
 
         <p className="text-center text-[10px] text-slate-600 mt-5 font-body-sm">

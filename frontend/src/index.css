@@ -22,9 +22,18 @@ body {
 }
 
 /* Premium Animations & Keyframes */
+/* Deliberately opacity-only (no transform) — animation-fill-mode: forwards on
+   .animate-fade-in below keeps the final keyframe's computed style applied
+   indefinitely, and ANY transform value (even translateY(0), a visual no-op)
+   makes the animated element a new containing block for its position:fixed
+   descendants. Every modal/drawer in the Hiring module lives inside a
+   <main class="animate-fade-in">, so that made "fixed" dialogs position
+   against <main>'s full scrollable height instead of the viewport — with a
+   long candidate list that pushed dialogs thousands of pixels off-screen,
+   looking like a blank popup that never actually renders visibly. */
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 @keyframes slideInLeft {
@@ -164,4 +173,44 @@ body {
 @keyframes tabPop {
   0% { transform: scale(0.95); }
   100% { transform: scale(1); }
+}
+
+/* Toast notifications */
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateX(40px) scale(0.95); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@keyframes toastSlideOut {
+  from { opacity: 1; transform: translateX(0) scale(1); max-height: 80px; margin-bottom: 8px; }
+  to { opacity: 0; transform: translateX(40px) scale(0.95); max-height: 0; margin-bottom: 0; }
+}
+
+.animate-toast-in {
+  animation: toastSlideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.animate-toast-out {
+  animation: toastSlideOut 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Sidebar badge count pop-in */
+@keyframes badgePop {
+  0% { transform: scale(0.5); opacity: 0; }
+  60% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+.animate-badge-pop {
+  animation: badgePop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+/* Active sidebar item accent bar */
+@keyframes accentGrow {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+.animate-accent-grow {
+  animation: accentGrow 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
 }

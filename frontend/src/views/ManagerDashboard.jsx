@@ -22,6 +22,8 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend, AreaChart, Area
 } from 'recharts';
+import { COUNSELING_STATUSES, getStatusStyle, getTodayISTDateString } from '../utils/statusStyles';
+import RemarksModal from '../components/RemarksModal';
 
 const SkillLabsLogo = ({ className = '' }) => (
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 50" className={className}>
@@ -166,9 +168,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
     d.setDate(1);
     return d.toISOString().split('T')[0];
   });
-  const [timelineEndDate, setTimelineEndDate] = useState(() => {
-    return new Date().toISOString().split('T')[0];
-  });
+  const [timelineEndDate, setTimelineEndDate] = useState(() => getTodayISTDateString());
   const [timelineSummary, setTimelineSummary] = useState({
     summary: {
       total_uploaded: 0,
@@ -198,7 +198,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const [decompStartDate, setDecompStartDate] = useState(
     new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10) // default 90 days (3 months)
   );
-  const [decompEndDate, setDecompEndDate] = useState(new Date().toISOString().slice(0, 10));
+  const [decompEndDate, setDecompEndDate] = useState(getTodayISTDateString());
   const [decompSearch, setDecompSearch] = useState('');
 
   // Forwarded Leads States
@@ -218,10 +218,12 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   // Master Lead list & detail drawer
   const [masterLeads, setMasterLeads] = useState([]);
   const [selectedLead, setSelectedLead] = useState(null);
+  const [remarksModalLead, setRemarksModalLead] = useState(null);
   const [leadTimeline, setLeadTimeline] = useState([]);
 
   // Reports state
-  const [metrics, setMetrics] = useState({ stages: [], closures: [], unassigned: 0 });
+  const [metrics, setMetrics] = useState({ statusCounts: [], notContactableBreakdown: [], leadPunchedBreakdown: { registrationStatus: [], feePaymentStatus: [] }, unassigned: 0, closuresSummary: [], leadTemperatureBreakdown: [] });
+  const [dataReport, setDataReport] = useState({ perCounselor: [], aggregate: { openingCF: 0, freshBase: 0, totalBase: 0, touchedBase: 0, touchPct: 0 } });
   const [leaderboard, setLeaderboard] = useState([]);
   const [sourceBreakdown, setSourceBreakdown] = useState([]);
   const [uploadTrend, setUploadTrend] = useState([]);
@@ -273,7 +275,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const [campaignLeadsSearch, setCampaignLeadsSearch] = useState('');
 
   // Daily Status Tracker state
-  const [trackingDate, setTrackingDate] = useState(new Date().toISOString().slice(0, 10));
+  const [trackingDate, setTrackingDate] = useState(getTodayISTDateString());
   const [trackingData, setTrackingData] = useState(null);
   const [trackingLoading, setTrackingLoading] = useState(false);
   const [trackingCategory, setTrackingCategory] = useState('all');
@@ -285,7 +287,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const [activityCounselorFilter, setActivityCounselorFilter] = useState('');
   const [activityActionFilter, setActivityActionFilter] = useState('');
   const [activityDateFrom, setActivityDateFrom] = useState('');
-  const [activityDateTo, setActivityDateTo] = useState(new Date().toISOString().slice(0, 10));
+  const [activityDateTo, setActivityDateTo] = useState(getTodayISTDateString());
   const [activitySearch, setActivitySearch] = useState('');
 
   // Master Repository search & filter states
@@ -715,15 +717,22 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
       const data = await response.json();
       if (response.ok) {
         setCounselors(data);
-        // Initialize allocations & targets
-        const initialAllocs = {};
-        const initialTargets = {};
-        data.forEach(c => {
-          initialAllocs[c.id] = 0;
-          initialTargets[c.id] = c.monthlyTarget || 10;
+        // This fetch is triggered on every tab switch (see the [activeTab] effect), not just
+        // when the Distribute/Targets tabs are opened — blindly overwriting `allocations`/
+        // `counselorTargets` here wiped any in-progress allocation counts or target edits the
+        // manager had typed the moment they so much as glanced at another tab. Preserve
+        // whatever's already there for counselors we already knew about; only seed defaults
+        // for ones we're seeing for the first time.
+        setAllocations(prev => {
+          const merged = {};
+          data.forEach(c => { merged[c.id] = prev[c.id] !== undefined ? prev[c.id] : 0; });
+          return merged;
         });
-        setAllocations(initialAllocs);
-        setCounselorTargets(initialTargets);
+        setCounselorTargets(prev => {
+          const merged = {};
+          data.forEach(c => { merged[c.id] = prev[c.id] !== undefined ? prev[c.id] : (c.monthlyTarget || 10); });
+          return merged;
+        });
       }
     } catch (err) {
       console.error(err);
@@ -813,7 +822,10 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
 
   const handleSaveTarget = async (counselorId) => {
     try {
-      const currentMonth = new Date().toISOString().substring(0, 7);
+      // IST month, matching the backend's getCurrentMonthKeyIST() — using the UTC month
+      // here would occasionally save a target under a different month bucket than the one
+      // the backend reads it back from, right after IST midnight on the 1st.
+      const currentMonth = new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().substring(0, 7);
       const targetCount = counselorTargets[counselorId] || 10;
       const response = await fetch('/api/manager/targets', {
         method: 'POST',
@@ -856,7 +868,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
 
   const fetchMetrics = async () => {
     try {
-      const response = await fetch('/api/reports/pipeline', {
+      const response = await fetch('/api/reports/data-status', {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
@@ -871,16 +883,21 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const fetchAllReportData = async () => {
     setReportLoading(true);
     try {
-      const [pipelineRes, leaderRes, sourceRes, trendRes] = await Promise.all([
-        fetch('/api/reports/pipeline', { headers: { 'Authorization': `Bearer ${token}` } }),
+      // data-status is deliberately NOT re-fetched here — fetchMetrics() already runs on
+      // every tab switch (it feeds the always-visible header "unassigned" count), including
+      // the switch into 'reports' that triggers this function, so re-fetching the identical
+      // endpoint here was just a second simultaneous request for the same data.
+      const [dataReportRes, leaderRes, sourceRes, trendRes] = await Promise.all([
+        fetch('/api/reports/data-report', { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch('/api/reports/counselor-leaderboard', { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch('/api/reports/source-breakdown', { headers: { 'Authorization': `Bearer ${token}` } }),
         fetch('/api/reports/upload-trend', { headers: { 'Authorization': `Bearer ${token}` } }),
+        fetchMetrics()
       ]);
-      const [pipeline, leader, source, trend] = await Promise.all([
-        pipelineRes.json(), leaderRes.json(), sourceRes.json(), trendRes.json()
+      const [report, leader, source, trend] = await Promise.all([
+        dataReportRes.json(), leaderRes.json(), sourceRes.json(), trendRes.json()
       ]);
-      if (pipelineRes.ok) setMetrics(pipeline);
+      if (dataReportRes.ok) setDataReport(report);
       if (leaderRes.ok) setLeaderboard(leader);
       if (sourceRes.ok) setSourceBreakdown(source);
       if (trendRes.ok) setUploadTrend(trend);
@@ -1053,7 +1070,11 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
 
   // Manual allocation input changes
   const handleAllocChange = (counselorId, val) => {
-    const intVal = parseInt(val, 10) || 0;
+    // Clamp to non-negative — the <input min="0"> only marks the field CSS-invalid, it
+    // doesn't stop the browser from accepting a typed negative number, which would
+    // understate totalAllocated and inflate remainingInPool, letting other rows' "max"
+    // cap (derived from remainingInPool) accept more than the pool actually has left.
+    const intVal = Math.max(0, parseInt(val, 10) || 0);
     setAllocations(prev => ({
       ...prev,
       [counselorId]: intVal
@@ -1087,11 +1108,15 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
       } else {
         triggerCelebration('Data Distributed! 🎯 Leads Assigned');
         alert(data.message);
-        // Reset state
+        // Reset state - re-fetch the pool with the current filters (rather than just
+        // blanking it) so the Distribution/Filter & Pool tabs immediately reflect the
+        // real remaining count instead of appearing empty until manually refreshed.
         fetchCounselors();
         fetchMasterLeads();
         fetchMetrics();
-        setPoolLeads([]);
+        fetchPoolData(filters);
+        fetchVaultBatches(vaultSearch);
+        setAllocations({});
         setActiveTab('repository');
       }
     } catch (err) {
@@ -1128,7 +1153,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
     if (repoStageFilter) {
       if (repoStageFilter === 'unassigned') {
         if (lead.counselor_name) return false;
-      } else if (lead.stage !== repoStageFilter) {
+      } else if (lead.counseling_status !== repoStageFilter) {
         return false;
       }
     }
@@ -1223,10 +1248,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               )}
             </button>
             <button
-              onClick={(e) => {
-                handleTabClick(setActiveTab, 'vault', e);
-                fetchVaultBatches('');
-              }}
+              onClick={(e) => handleTabClick(setActiveTab, 'vault', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'vault' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
               style={activeTab === 'vault' ? { background: '#F7941D' } : {}}
             >
@@ -1234,10 +1256,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               <span>Data Vault</span>
             </button>
             <button
-              onClick={(e) => {
-                handleTabClick(setActiveTab, 'tracking', e);
-                fetchDailyTracking(trackingDate);
-              }}
+              onClick={(e) => handleTabClick(setActiveTab, 'tracking', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'tracking' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
               style={activeTab === 'tracking' ? { background: '#059669' } : {}}
             >
@@ -1245,10 +1264,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               <span>Daily Tracker</span>
             </button>
             <button
-              onClick={(e) => {
-                handleTabClick(setActiveTab, 'activity', e);
-                fetchActivityLogs();
-              }}
+              onClick={(e) => handleTabClick(setActiveTab, 'activity', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'activity' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
               style={activeTab === 'activity' ? { background: '#7C3AED' } : {}}
             >
@@ -1256,10 +1272,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               <span>Activity Logs</span>
             </button>
             <button
-               onClick={(e) => {
-                 handleTabClick(setActiveTab, 'decompositions', e);
-                 fetchDecompositions();
-               }}
+               onClick={(e) => handleTabClick(setActiveTab, 'decompositions', e)}
                className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'decompositions' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
                style={activeTab === 'decompositions' ? { background: '#0D9488' } : {}}
              >
@@ -1267,10 +1280,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                <span>Lead Journeys & Audits</span>
              </button>
              <button
-               onClick={(e) => {
-                 handleTabClick(setActiveTab, 'dropped', e);
-                 fetchManagerDroppedLeads();
-               }}
+               onClick={(e) => handleTabClick(setActiveTab, 'dropped', e)}
                className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'dropped' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
                style={activeTab === 'dropped' ? { background: '#EF4444' } : {}}
              >
@@ -1289,10 +1299,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               <span>Forwarded Leads</span>
             </button>
             <button
-              onClick={(e) => {
-                handleTabClick(setActiveTab, 'universities', e);
-                fetchUniversities();
-              }}
+              onClick={(e) => handleTabClick(setActiveTab, 'universities', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded active:scale-95 transition duration-150 ${activeTab === 'universities' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
               style={activeTab === 'universities' ? { background: '#1BACE4' } : {}}
             >
@@ -1543,7 +1550,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     <button
                       onClick={() => {
                         setPoolLeads([]);
-                        setFilters({ ...filters, start_date: new Date().toISOString().split('T')[0] });
+                        setFilters({ ...filters, start_date: getTodayISTDateString() });
                         setActiveTab('pool');
                       }}
                       className="flex items-center gap-1.5 py-1.5 px-3 bg-[#0F4C5C] hover:bg-[#0A333E] text-white text-xs font-semibold rounded transition"
@@ -1603,7 +1610,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     {/* Individual batches */}
                     {vaultBatches.map(b => {
                       const totalClean = b.clean_rows || 0;
-                      const remClean = b.remaining_clean_count !== undefined ? b.remaining_clean_count : totalClean;
+                      const remClean = b.remaining_clean_count !== undefined ? b.remaining_clean_count : 0;
                       const distClean = b.distributed_clean_count !== undefined ? b.distributed_clean_count : 0;
                       const progressPct = totalClean > 0 ? (distClean / totalClean) * 100 : 0;
                       const isSelected = filters.upload_batch_id === b.id;
@@ -2044,17 +2051,17 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                         ))}
                       </select>
 
-                      {/* Stage Filter */}
+                      {/* Status Filter */}
                       <select
                         value={repoStageFilter}
                         onChange={(e) => setRepoStageFilter(e.target.value)}
                         className="text-xs p-2 bg-white border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#0F4C5C]"
                       >
-                        <option value="">All Stages</option>
+                        <option value="">All Statuses</option>
                         <option value="unassigned">Unassigned Pool</option>
-                        <option value="L1">Level 1 (Qualification)</option>
-                        <option value="L2">Level 2 (Counseling)</option>
-                        <option value="L3">Level 3 (Closure)</option>
+                        {COUNSELING_STATUSES.map(s => (
+                          <option key={s} value={s}>{s}</option>
+                        ))}
                       </select>
                     </div>
                   </div>
@@ -2070,14 +2077,15 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <th className="p-3">Experience</th>
                           <th className="p-3">Source</th>
                           <th className="p-3">Owner Counselor</th>
-                          <th className="p-3">Pipeline Stage</th>
+                          <th className="p-3">Counseling Status</th>
+                          <th className="p-3">Remark</th>
                           <th className="p-3">Data Status</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[#E2E8F0] text-xs font-body-sm text-[#111C2D]">
                         {repositoryFilteredLeads.length === 0 ? (
                           <tr>
-                            <td colSpan="9" className="p-8 text-center text-[#70787C] italic">
+                            <td colSpan="10" className="p-8 text-center text-[#70787C] italic">
                               No leads match your search and filter criteria.
                             </td>
                           </tr>
@@ -2109,17 +2117,16 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                 )}
                               </td>
                             <td className="p-3">
-                              {lead.stage ? (
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                  lead.stage === 'L1' ? 'bg-slate-100 text-slate-700' :
-                                  lead.stage === 'L2' ? 'bg-amber-100 text-amber-700 font-medium' :
-                                  'bg-green-100 text-green-700'
-                                }`}>
-                                  {lead.stage}
+                              {lead.counseling_status ? (
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(lead.counseling_status).badge}`}>
+                                  {lead.counseling_status}
                                 </span>
                               ) : (
                                 <span className="text-xs text-slate-400 italic">None</span>
                               )}
+                            </td>
+                            <td className="p-3 max-w-[200px] truncate text-slate-600" title={lead.status_remark || ''}>
+                              {lead.status_remark || <span className="text-slate-300 italic">No remark</span>}
                             </td>
                             <td className="p-3">
                               <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium uppercase ${
@@ -2297,110 +2304,209 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                   <span className="text-[10px] text-slate-500">Auto-logging all exports & downloads</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] bg-[#E2E8F0] px-2 py-0.5 rounded font-bold uppercase tracking-wider font-label-caps text-slate-700">Domain Filter: @company.com</span>
+                  <span className="text-[10px] bg-[#E2E8F0] px-2 py-0.5 rounded font-bold uppercase tracking-wider font-label-caps text-slate-700">Domain Filter: @skilllabs.net</span>
                   <span className="text-[10px] bg-[#E2E8F0] px-2 py-0.5 rounded font-bold uppercase tracking-wider font-label-caps text-slate-700">Log Feed: ENFORCED</span>
                 </div>
               </div>
 
-              {/* KPI Summary Cards */}
+              {/* Daily Data Report — Carry Forward composition + contact funnel.
+                  Not Interested / Job Seeker / Duplicate Lead are terminal statuses: the
+                  moment a counselor sets them, their lead_assignments row is deleted and a
+                  closures row is written instead (see migration
+                  20260718000000_add_counseling_status_to_assignments.js), so those three
+                  counts must be read from metrics.closuresSummary, never from
+                  metrics.statusCounts — the latter would just show ~0 for them. */}
               {(() => {
-                const enrolled = metrics.closures.find(c => c.final_status === 'enrolled');
-                const lost = metrics.closures.find(c => c.final_status === 'lost');
-                const enrolledCount = parseInt(enrolled?.count || 0, 10);
-                const lostCount = parseInt(lost?.count || 0, 10);
-                const revenue = parseFloat(enrolled?.total_revenue || 0);
-                const totalClosed = enrolledCount + lostCount;
-                const convRate = totalClosed > 0 ? ((enrolledCount / totalClosed) * 100).toFixed(1) : '0.0';
-                const totalActive = metrics.stages.reduce((s, r) => s + parseInt(r.count || 0, 10), 0);
+                const { openingCF, freshBase, totalBase, cfAhead, cfPending, cfClosedToday, cfOriginalTotal } = dataReport.aggregate;
+                const notContactedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Not Contacted')?.count || 0, 10);
+                const interestedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Interested')?.count || 0, 10);
+                const callBackCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Call Back')?.count || 0, 10);
+                const coldCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Cold')?.count || 0, 10);
+                const notContactableCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Not Contactable')?.count || 0, 10);
+                const leadPunchedCount = parseInt(metrics.statusCounts.find(s => s.counseling_status === 'Lead Punched')?.count || 0, 10);
+                const notInterestedCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'lost')?.count || 0, 10);
+                const jobSeekerCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'job_seeker')?.count || 0, 10);
+                const duplicateCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'duplicate')?.count || 0, 10);
+                const enrolledCount = parseInt(metrics.closuresSummary.find(c => c.final_status === 'enrolled')?.count || 0, 10);
+                const hotLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Hot')?.count || 0, 10);
+                const warmLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Warm')?.count || 0, 10);
+                const coldLeadCount = parseInt(metrics.leadTemperatureBreakdown.find(t => t.lead_temperature === 'Cold')?.count || 0, 10);
+                const connectedCount = Math.max(totalBase - notContactedCount, 0);
+                const connectedPct = totalBase > 0 ? Math.round((connectedCount / totalBase) * 1000) / 10 : 0;
+
                 return (
-                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                    <div className="bg-white border border-[#E2E8F0] rounded p-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="p-1.5 bg-blue-50 rounded"><span className="material-symbols-outlined text-blue-600 text-base">people</span></div>
-                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Active Leads</span>
+                  <div className="space-y-4">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-[#40484B] font-label-caps flex items-center gap-2">
+                      <span className="material-symbols-outlined text-[#0F4C5C] text-base">event_repeat</span>
+                      Daily Data Report — Carry Forward &amp; Contact Funnel
+                    </h3>
+
+                    {/* Base composition: how much of today's pool is old carry-forward vs freshly assigned */}
+                    <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Opening Carry Forward</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-amber-600">{cfOriginalTotal}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">Un-worked leads rolled over from earlier uploads (e.g. 16 Jul data still open on 18 Jul)</div>
+                        <div className="flex items-center gap-3 mt-2 pt-2 border-t border-[#F0F4F8] text-[10px] font-bold">
+                          <span className="text-[#1BACE4]">Ahead: {cfAhead + cfClosedToday}</span>
+                          <span className="text-slate-500">Pending: {cfPending}</span>
+                        </div>
+                        {cfClosedToday > 0 && (
+                          <div className="text-[9px] text-[#70787C] mt-1">Includes {cfClosedToday} CF lead{cfClosedToday === 1 ? '' : 's'} closed out today ({openingCF} still open)</div>
+                        )}
                       </div>
-                      <div className="text-2xl font-bold text-[#111C2D] font-data-mono">{totalActive}</div>
-                      <div className="text-[10px] text-[#70787C] mt-1">In L1 / L2 / L3 pipeline</div>
-                    </div>
-                    <div className="bg-white border border-[#E2E8F0] rounded p-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="p-1.5 bg-amber-50 rounded"><span className="material-symbols-outlined text-amber-500 text-base">inbox</span></div>
-                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Unassigned</span>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Fresh Base (Today)</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-green-600">{freshBase}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">Newly assigned to counselors today</div>
                       </div>
-                      <div className="text-2xl font-bold text-amber-500 font-data-mono">{metrics.unassigned}</div>
-                      <div className="text-[10px] text-[#70787C] mt-1">Clean leads pending distribution</div>
-                    </div>
-                    <div className="bg-white border border-[#E2E8F0] rounded p-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="p-1.5 bg-green-50 rounded"><span className="material-symbols-outlined text-green-600 text-base">check_circle</span></div>
-                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Enrolled</span>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Total Active Base</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-[#111C2D]">{totalBase}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">Opening CF + Fresh, still sitting with counselors</div>
                       </div>
-                      <div className="text-2xl font-bold text-green-600 font-data-mono">{enrolledCount}</div>
-                      <div className="text-[10px] text-[#70787C] mt-1">Successfully closed</div>
-                    </div>
-                    <div className="bg-white border border-[#E2E8F0] rounded p-4">
-                      <div className="flex items-center gap-2 mb-2">
-                        <div className="p-1.5 bg-red-50 rounded"><span className="material-symbols-outlined text-red-500 text-base">cancel</span></div>
-                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Lost</span>
-                      </div>
-                      <div className="text-2xl font-bold text-red-500 font-data-mono">{lostCount}</div>
-                      <div className="text-[10px] text-[#70787C] mt-1">Closed as lost / dropped</div>
                     </div>
 
+                    {/* Contact funnel: what's happened to that base — contacted leads shunt out of the main (Not Contacted) pool into their own category */}
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Not Contacted</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Contacted').color }}>{notContactedCount}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">Still sitting in the main pool</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Connected</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-[#1BACE4]">{connectedCount}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">{connectedPct}% of total base — contacted &amp; moved out of the main pool</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Interested</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Interested').color }}>{interestedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Not Interested</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Interested').color }}>{notInterestedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Job Seeker</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Job Seeker').color }}>{jobSeekerCount}</div>
+                      </div>
+                    </div>
+
+                    {/* Secondary breakdown */}
+                    <div className="grid grid-cols-2 lg:grid-cols-7 gap-4">
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <div className="flex items-center gap-2 mb-2">
+                          <div className="p-1.5 bg-amber-50 rounded"><span className="material-symbols-outlined text-amber-500 text-base">inbox</span></div>
+                          <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Unassigned</span>
+                        </div>
+                        <div className="text-2xl font-bold text-amber-500 font-data-mono">{metrics.unassigned}</div>
+                        <div className="text-[10px] text-[#70787C] mt-1">Clean leads pending distribution</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Call Back</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Call Back').color }}>{callBackCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Cold</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Cold').color }}>{coldCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Not Contactable</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Not Contactable').color }}>{notContactableCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Lead Punched</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Lead Punched').color }}>{leadPunchedCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <div className="flex items-center gap-2 mb-2">
+                          <div className="p-1.5 bg-green-50 rounded"><span className="material-symbols-outlined text-green-600 text-base">check_circle</span></div>
+                          <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Enrolled</span>
+                        </div>
+                        <div className="text-2xl font-bold text-green-600 font-data-mono">{enrolledCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">Duplicate Lead</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1" style={{ color: getStatusStyle('Duplicate Lead').color }}>{duplicateCount}</div>
+                      </div>
+                    </div>
+
+                    {/* Lead Temperature — sales intent on Interested/Lead Punched/Duplicate
+                        Lead leads, independent of the 'Cold' counseling_status above */}
+                    <div className="grid grid-cols-3 gap-4">
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">🔥 Hot Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-red-600">{hotLeadCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">🌤️ Warm Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-amber-600">{warmLeadCount}</div>
+                      </div>
+                      <div className="bg-white border border-[#E2E8F0] rounded p-4">
+                        <span className="text-[11px] text-[#70787C] font-label-caps uppercase">❄️ Cold Leads</span>
+                        <div className="text-2xl font-bold font-data-mono mt-1 text-sky-600">{coldLeadCount}</div>
+                      </div>
+                    </div>
                   </div>
                 );
               })()}
 
-              {/* Row 1: Pipeline Funnel + Conversion Donut */}
+              {/* Row 1: Data Report (FA/CF/Touch%) + Closure Breakdown */}
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-                {/* Pipeline Funnel Bar Chart */}
+                {/* Data Report Bar Chart */}
                 <div className="lg:col-span-2 bg-white border border-[#E2E8F0] rounded p-5">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-[#40484B] font-label-caps mb-4 flex items-center gap-2">
                     <span className="material-symbols-outlined text-[#0F4C5C] text-base">filter_alt</span>
-                    CRM Pipeline Funnel (L1 → L2 → L3)
+                    Data Report — Opening CF / Fresh Base / Touched
                   </h3>
                   {(() => {
-                    const l1 = parseInt(metrics.stages.find(s => s.stage === 'L1')?.count || 0, 10);
-                    const l2 = parseInt(metrics.stages.find(s => s.stage === 'L2')?.count || 0, 10);
-                    const l3 = parseInt(metrics.stages.find(s => s.stage === 'L3')?.count || 0, 10);
-                    const funnelData = [
-                      { stage: 'L1 — Qualification', leads: l1, fill: '#3B82F6' },
-                      { stage: 'L2 — Counseling', leads: l2, fill: '#8B5CF6' },
-                      { stage: 'L3 — Closure', leads: l3, fill: '#14B8A6' },
+                    const { openingCF, freshBase, touchedBase, totalBase, touchPct } = dataReport.aggregate;
+                    const reportData = [
+                      { label: 'Opening CF', leads: openingCF, fill: '#F7941D' },
+                      { label: 'Fresh Base', leads: freshBase, fill: '#10B981' },
+                      { label: 'Touched Today', leads: touchedBase, fill: '#1BACE4' },
                     ];
                     return (
-                      <ResponsiveContainer width="100%" height={220}>
-                        <BarChart data={funnelData} layout="vertical" margin={{ left: 10, right: 20 }}>
-                          <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#F1F5F9" />
-                          <XAxis type="number" tick={{ fontSize: 10, fill: '#70787C' }} />
-                          <YAxis dataKey="stage" type="category" width={140} tick={{ fontSize: 10, fill: '#40484B' }} />
-                          <Tooltip
-                            contentStyle={{ fontSize: 11, border: '1px solid #E2E8F0', borderRadius: 4 }}
-                            formatter={(v) => [v + ' leads', 'Active']}
-                          />
-                          <Bar dataKey="leads" radius={[0, 4, 4, 0]}>
-                            {funnelData.map((d, i) => <Cell key={i} fill={d.fill} />)}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
+                      <>
+                        <ResponsiveContainer width="100%" height={190}>
+                          <BarChart data={reportData} layout="vertical" margin={{ left: 10, right: 20 }}>
+                            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#F1F5F9" />
+                            <XAxis type="number" tick={{ fontSize: 10, fill: '#70787C' }} />
+                            <YAxis dataKey="label" type="category" width={110} tick={{ fontSize: 10, fill: '#40484B' }} />
+                            <Tooltip
+                              contentStyle={{ fontSize: 11, border: '1px solid #E2E8F0', borderRadius: 4 }}
+                              formatter={(v) => [v + ' leads', 'Count']}
+                            />
+                            <Bar dataKey="leads" radius={[0, 4, 4, 0]}>
+                              {reportData.map((d, i) => <Cell key={i} fill={d.fill} />)}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                        <div className="text-center text-xs font-bold text-[#1BACE4] mt-2">Touch% = {touchPct}% of Total Base ({totalBase})</div>
+                      </>
                     );
                   })()}
                 </div>
 
-                {/* Conversion Donut */}
+                {/* Closure Donut */}
                 <div className="bg-white border border-[#E2E8F0] rounded p-5">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-[#40484B] font-label-caps mb-4 flex items-center gap-2">
                     <span className="material-symbols-outlined text-[#0F4C5C] text-base">donut_large</span>
                     Closure Breakdown
                   </h3>
                   {(() => {
-                    const enrolled = parseInt(metrics.closures.find(c => c.final_status === 'enrolled')?.count || 0, 10);
-                    const lost = parseInt(metrics.closures.find(c => c.final_status === 'lost')?.count || 0, 10);
-                    const active = metrics.stages.reduce((s, r) => s + parseInt(r.count || 0, 10), 0);
+                    const enrolled = parseInt(metrics.closuresSummary.find(c => c.final_status === 'enrolled')?.count || 0, 10);
+                    const lost = parseInt(metrics.closuresSummary.find(c => c.final_status === 'lost')?.count || 0, 10);
+                    const duplicate = parseInt(metrics.closuresSummary.find(c => c.final_status === 'duplicate')?.count || 0, 10);
+                    const jobSeeker = parseInt(metrics.closuresSummary.find(c => c.final_status === 'job_seeker')?.count || 0, 10);
+                    const active = dataReport.aggregate.totalBase;
                     const donutData = [
                       { name: 'Enrolled', value: enrolled, color: '#22C55E' },
-                      { name: 'Lost', value: lost, color: '#EF4444' },
+                      { name: 'Not Interested', value: lost, color: '#EF4444' },
+                      { name: 'Duplicate Lead', value: duplicate, color: '#8B5CF6' },
+                      { name: 'Job Seeker', value: jobSeeker, color: '#FB923C' },
                       { name: 'Active', value: active, color: '#3B82F6' },
                     ].filter(d => d.value > 0);
                     if (donutData.length === 0) return <div className="flex items-center justify-center h-40 text-xs text-[#70787C] italic">No closure data yet.</div>;
@@ -2437,9 +2543,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                         <YAxis tick={{ fontSize: 10, fill: '#70787C' }} />
                         <Tooltip contentStyle={{ fontSize: 11, border: '1px solid #E2E8F0', borderRadius: 4 }} />
                         <Legend iconSize={8} wrapperStyle={{ fontSize: 10 }} />
-                        <Bar dataKey="L1" name="L1 Active" fill="#3B82F6" radius={[2,2,0,0]} />
-                        <Bar dataKey="L2" name="L2 Active" fill="#8B5CF6" radius={[2,2,0,0]} />
-                        <Bar dataKey="L3" name="L3 Active" fill="#14B8A6" radius={[2,2,0,0]} />
+                        <Bar dataKey="openingCF" name="Opening CF" fill="#F7941D" radius={[2,2,0,0]} />
+                        <Bar dataKey="freshBase" name="Fresh Base" fill="#10B981" radius={[2,2,0,0]} />
+                        <Bar dataKey="touchedBase" name="Touched" fill="#1BACE4" radius={[2,2,0,0]} />
                         <Bar dataKey="enrolled" name="Enrolled" fill="#22C55E" radius={[2,2,0,0]} />
                         <Bar dataKey="lost" name="Lost" fill="#EF4444" radius={[2,2,0,0]} />
                       </BarChart>
@@ -2452,9 +2558,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[10px] text-[#70787C] uppercase tracking-wider font-label-caps">
                             <th className="p-2">#</th>
                             <th className="p-2">Counselor</th>
-                            <th className="p-2 text-center text-blue-600">L1</th>
-                            <th className="p-2 text-center text-violet-600">L2</th>
-                            <th className="p-2 text-center text-teal-600">L3</th>
+                            <th className="p-2 text-center text-amber-600">Opening CF</th>
+                            <th className="p-2 text-center text-green-600">Fresh</th>
+                            <th className="p-2 text-center text-sky-600">Touch%</th>
                             <th className="p-2 text-center text-green-600">✅</th>
                             <th className="p-2 text-center text-red-500">❌</th>
                             <th className="p-2 text-right text-[#0F4C5C]">Revenue</th>
@@ -2465,9 +2571,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                             <tr key={c.id} className="hover:bg-[#F8FAFC] transition">
                               <td className="p-2 text-[#70787C] font-data-mono">{i + 1}</td>
                               <td className="p-2 font-semibold text-[#111C2D]">{c.name}</td>
-                              <td className="p-2 text-center font-data-mono text-blue-600">{c.L1}</td>
-                              <td className="p-2 text-center font-data-mono text-violet-600">{c.L2}</td>
-                              <td className="p-2 text-center font-data-mono text-teal-600">{c.L3}</td>
+                              <td className="p-2 text-center font-data-mono text-amber-600">{c.openingCF}</td>
+                              <td className="p-2 text-center font-data-mono text-green-600">{c.freshBase}</td>
+                              <td className="p-2 text-center font-data-mono text-sky-600">{c.touchPct}%</td>
                               <td className="p-2 text-center font-data-mono text-green-600 font-bold">{c.enrolled}</td>
                               <td className="p-2 text-center font-data-mono text-red-500">{c.lost}</td>
                               <td className="p-2 text-right font-data-mono text-[#0F4C5C] font-bold">₹{Number(c.revenue).toLocaleString('en-IN')}</td>
@@ -2541,15 +2647,15 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                 </div>
               </div>
 
-              {/* L3 Confirmed Joins Panel */}
+              {/* Lead Punched — Registration & Fee Tracking Panel */}
               <div className="bg-white border border-[#E2E8F0] rounded p-5 space-y-4 shadow-sm">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E2E8F0] pb-3">
                   <div>
                     <h3 className="text-xs font-bold uppercase tracking-wider text-[#111C2D] font-label-caps flex items-center gap-1.5">
                       <span className="material-symbols-outlined text-[#14B8A6]">school</span>
-                      Level 3 Closure Pipeline & Admissions Confirmed to Join
+                      Lead Punched — Registration &amp; Fee Tracking (L2)
                     </h3>
-                    <p className="text-[10px] text-slate-500 font-medium mt-0.5">Track students finalized or close to finalizing admission choices.</p>
+                    <p className="text-[10px] text-slate-500 font-medium mt-0.5">Leads marked Lead Punched, with registration and fee-payment progress. Fee due/overdue reminders are highlighted.</p>
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-slate-500 font-semibold">Search:</span>
@@ -2564,8 +2670,8 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                 </div>
 
                 {(() => {
-                  const l3Leads = masterLeads.filter(l => {
-                    if (l.stage !== 'L3') return false;
+                  const punchedLeads = masterLeads.filter(l => {
+                    if (l.counseling_status !== 'Lead Punched') return false;
                     if (!l3SearchQuery) return true;
                     const s = l3SearchQuery.toLowerCase();
                     return (
@@ -2577,8 +2683,8 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     );
                   });
 
-                  if (l3Leads.length === 0) {
-                    return <div className="text-xs text-[#70787C] italic text-center py-6">No Level 3 closure students currently in the pipeline matching search criteria.</div>;
+                  if (punchedLeads.length === 0) {
+                    return <div className="text-xs text-[#70787C] italic text-center py-6">No Lead Punched students currently in the pipeline matching search criteria.</div>;
                   }
                   return (
                     <div className="overflow-x-auto border border-[#E2E8F0] rounded-lg">
@@ -2587,15 +2693,20 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps">
                             <th className="p-3">Candidate</th>
                             <th className="p-3">Masked Phone</th>
-                            <th className="p-3">University Finalized</th>
+                            <th className="p-3">University</th>
                             <th className="p-3">Course / Spec</th>
                             <th className="p-3">Counselor</th>
-                            <th className="p-3 text-right">Revenue Generated</th>
-                            <th className="p-3">Status</th>
+                            <th className="p-3">Registration</th>
+                            <th className="p-3">Fee Payment</th>
+                            <th className="p-3 text-right">Amount Paid / Total</th>
+                            <th className="p-3">Reminder Due</th>
+                            <th className="p-3">Remark</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#E2E8F0] font-body-sm text-[#111C2D]">
-                          {l3Leads.map(lead => (
+                          {punchedLeads.map(lead => {
+                            const overdue = lead.fee_reminder_due_at && new Date(lead.fee_reminder_due_at) < new Date();
+                            return (
                             <tr key={lead.id} className="hover:bg-slate-50 transition">
                               <td className="p-3 font-semibold text-[#0F4C5C]">{lead.name}</td>
                               <td className="p-3 font-data-mono"><MaskedPhone phone={lead.phone} /></td>
@@ -2606,16 +2717,43 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                               </td>
                               <td className="p-3">{lead.course_interest || '—'}</td>
                               <td className="p-3 font-medium text-slate-700">{lead.counselor_name || 'Unassigned'}</td>
-                              <td className="p-3 text-right font-bold font-data-mono text-[#059669]">
-                                ₹{parseFloat(lead.salary || 0).toLocaleString()}
-                              </td>
                               <td className="p-3">
-                                <span className="px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                  L3 Active
+                                <span className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${lead.registration_status === 'Registered' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-600 border border-slate-300'}`}>
+                                  {lead.registration_status || 'Not Registered'}
                                 </span>
                               </td>
+                              <td className="p-3">
+                                <span className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold uppercase ${lead.fee_payment_status === 'Full' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : lead.fee_payment_status === 'Partial' ? 'bg-amber-50 text-amber-700 border border-amber-200' : 'bg-slate-100 text-slate-600 border border-slate-300'}`}>
+                                  {lead.fee_payment_status || 'None'}
+                                </span>
+                              </td>
+                              <td className="p-3 text-right font-bold font-data-mono text-[#059669]">
+                                ₹{parseFloat(lead.fee_amount_paid || 0).toLocaleString()} / ₹{parseFloat(lead.fee_total_amount || 0).toLocaleString()}
+                              </td>
+                              <td className="p-3">
+                                {lead.fee_reminder_due_at ? (
+                                  <span className={`text-[10px] font-bold ${overdue ? 'text-red-600' : 'text-slate-500'}`}>
+                                    {new Date(lead.fee_reminder_due_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}{overdue ? ' (Overdue)' : ''}
+                                  </span>
+                                ) : <span className="text-[10px] text-slate-300">—</span>}
+                              </td>
+                              <td className="p-3 max-w-[160px]">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate text-slate-600" title={lead.status_remark || ''}>
+                                    {lead.status_remark || <span className="text-slate-300 italic">No remark</span>}
+                                  </span>
+                                  <button
+                                    onClick={() => setRemarksModalLead(lead)}
+                                    className="shrink-0 text-slate-400 hover:text-[#1BACE4]"
+                                    title="View all remarks"
+                                  >
+                                    <span className="material-symbols-outlined text-sm">forum</span>
+                                  </button>
+                                </div>
+                              </td>
                             </tr>
-                          ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -2729,8 +2867,8 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <span className="text-slate-300 text-sm">/</span>
                           <span className="text-red-500 text-sm">{timelineSummary.summary.lost}</span>
                         </h4>
-                        <p className="text-[10px] text-slate-500 mt-1 font-body-xs leading-none">
-                          Conversion Rate: {timelineSummary.summary.total_distributed > 0 ? ((timelineSummary.summary.enrolled / timelineSummary.summary.total_distributed) * 100).toFixed(1) : 0}%
+                        <p className="text-[10px] text-slate-500 mt-1 font-body-xs leading-none" title="Enrolled leads closed in this range, as a share of leads distributed in this range — not a strict cohort match, since a lead can be distributed in one period and close in another.">
+                          Conversion Rate: {timelineSummary.summary.total_distributed > 0 ? Math.min(100, (timelineSummary.summary.enrolled / timelineSummary.summary.total_distributed) * 100).toFixed(1) : 0}%
                         </p>
                       </div>
                     </div>
@@ -2810,9 +2948,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <thead>
                             <tr className="bg-slate-50 border-b border-[#E2E8F0] text-[#40484B] font-bold">
                               <th className="p-3 font-semibold">Counselor Name</th>
-                              <th className="p-3 font-semibold text-center">Level 1</th>
-                              <th className="p-3 font-semibold text-center">Level 2</th>
-                              <th className="p-3 font-semibold text-center">Level 3</th>
+                              <th className="p-3 font-semibold text-center">Interested</th>
+                              <th className="p-3 font-semibold text-center">Not Contactable</th>
+                              <th className="p-3 font-semibold text-center">Lead Punched</th>
                               <th className="p-3 font-semibold text-center text-green-600">Enrolled</th>
                               <th className="p-3 font-semibold text-center text-red-500">Lost/Dropped</th>
                               <th className="p-3 font-semibold text-right">Revenue Generated</th>
@@ -2821,14 +2959,18 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           </thead>
                           <tbody>
                             {timelineSummary.counselors.map(c => {
-                              const totalAssigned = c.L1 + c.L2 + c.L3 + c.enrolled + c.lost;
-                              const conversionRate = totalAssigned > 0 ? ((c.enrolled / totalAssigned) * 100).toFixed(1) : 0;
+                              const totalAssigned = c.notContacted + c.interested + (c.callBack || 0) + (c.cold || 0) + c.notContactable + c.leadPunched + c.enrolled + c.lost;
+                              // Status counts reflect leads ASSIGNED in this range; enrolled/lost reflect
+                              // leads CLOSED in this range — not always the same leads, so clamp rather
+                              // than let a counselor with few new assignments but several old leads
+                              // closing show >100%.
+                              const conversionRate = totalAssigned > 0 ? Math.min(100, (c.enrolled / totalAssigned) * 100).toFixed(1) : 0;
                               return (
                                 <tr key={c.id} className="border-b border-[#E2E8F0]/70 hover:bg-slate-50 transition">
                                   <td className="p-3 font-bold text-slate-700">{c.name}</td>
-                                  <td className="p-3 text-center text-blue-500 font-data-mono font-semibold">{c.L1}</td>
-                                  <td className="p-3 text-center text-violet-500 font-data-mono font-semibold">{c.L2}</td>
-                                  <td className="p-3 text-center text-teal-650 font-data-mono font-semibold">{c.L3}</td>
+                                  <td className="p-3 text-center text-green-600 font-data-mono font-semibold">{c.interested}</td>
+                                  <td className="p-3 text-center text-amber-600 font-data-mono font-semibold">{c.notContactable}</td>
+                                  <td className="p-3 text-center text-sky-600 font-data-mono font-semibold">{c.leadPunched}</td>
                                   <td className="p-3 text-center text-green-600 font-bold font-data-mono">{c.enrolled}</td>
                                   <td className="p-3 text-center text-red-500 font-bold font-data-mono">{c.lost}</td>
                                   <td className="p-3 text-right text-slate-700 font-semibold font-data-mono">₹{c.revenue.toLocaleString('en-IN')}</td>
@@ -2913,9 +3055,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                     }`}>
                                       {l.closure_status}
                                     </span>
-                                  ) : l.stage ? (
-                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
-                                      Stage: {l.stage}
+                                  ) : l.counseling_status ? (
+                                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${getStatusStyle(l.counseling_status).badge}`}>
+                                      {l.counseling_status}
                                     </span>
                                   ) : (
                                     <span className="text-slate-400 italic">Unassigned</span>
@@ -3150,20 +3292,16 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                       </div>
                     </div>
 
-                    {/* Pipeline Stage counts */}
+                    {/* Counseling Status counts — every status actually present in batch.statuses,
+                        not a fixed 3-key subset (that silently hid Not Contacted/Call Back/Cold
+                        leads from this breakdown even though the backend already returns them) */}
                     <div className="col-span-2 md:col-span-4 lg:col-span-3 grid grid-cols-3 gap-3">
-                      <div className="bg-blue-50 border border-blue-200 rounded p-3 text-center">
-                        <div className="text-base font-bold text-blue-600 font-data-mono">{batch.stages.L1}</div>
-                        <div className="text-[10px] text-blue-700 font-label-caps mt-1">Level 1</div>
-                      </div>
-                      <div className="bg-violet-50 border border-violet-200 rounded p-3 text-center">
-                        <div className="text-base font-bold text-violet-600 font-data-mono">{batch.stages.L2}</div>
-                        <div className="text-[10px] text-violet-700 font-label-caps mt-1">Level 2</div>
-                      </div>
-                      <div className="bg-teal-50 border border-teal-200 rounded p-3 text-center">
-                        <div className="text-base font-bold text-teal-600 font-data-mono">{batch.stages.L3}</div>
-                        <div className="text-[10px] text-teal-700 font-label-caps mt-1">Level 3</div>
-                      </div>
+                      {Object.entries(batch.statuses).filter(([, count]) => count > 0).map(([status, count]) => (
+                        <div key={status} className="bg-white border border-[#E2E8F0] rounded p-3 text-center">
+                          <div className="text-base font-bold font-data-mono" style={{ color: getStatusStyle(status).color }}>{count}</div>
+                          <div className="text-[10px] font-label-caps mt-1" style={{ color: getStatusStyle(status).color }}>{status}</div>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
@@ -3243,9 +3381,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                       <th className="p-2.5">Counselor</th>
                                       <th className="p-2.5">Email</th>
                                       <th className="p-2.5 text-center">Assigned</th>
-                                      <th className="p-2.5 text-center text-blue-600">L1</th>
-                                      <th className="p-2.5 text-center text-violet-600">L2</th>
-                                      <th className="p-2.5 text-center text-teal-600">L3</th>
+                                      <th className="p-2.5">Status Breakdown</th>
                                       <th className="p-2.5 text-center text-green-600">Enrolled</th>
                                       <th className="p-2.5 text-center text-red-500">Lost</th>
                                       <th className="p-2.5 text-right text-[#0F4C5C]">Revenue</th>
@@ -3264,9 +3400,15 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                         </td>
                                         <td className="p-2.5 text-[#70787C] font-data-mono">{alloc.counselor_email}</td>
                                         <td className="p-2.5 text-center font-bold font-data-mono">{alloc.requested_count}</td>
-                                        <td className="p-2.5 text-center font-data-mono text-blue-600">{alloc.stages.L1}</td>
-                                        <td className="p-2.5 text-center font-data-mono text-violet-600">{alloc.stages.L2}</td>
-                                        <td className="p-2.5 text-center font-data-mono text-teal-600">{alloc.stages.L3}</td>
+                                        <td className="p-2.5">
+                                          <div className="flex flex-wrap gap-1">
+                                            {Object.entries(alloc.statuses || {}).filter(([, count]) => count > 0).map(([status, count]) => (
+                                              <span key={status} className="px-1.5 py-0.5 rounded text-[9px] font-bold" style={{ color: getStatusStyle(status).color, background: getStatusStyle(status).color + '1A' }}>
+                                                {status}: {count}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        </td>
                                         <td className="p-2.5 text-center font-data-mono text-green-600 font-bold">{alloc.conversions.enrolled}</td>
                                         <td className="p-2.5 text-center font-data-mono text-red-500">{alloc.conversions.lost}</td>
                                         <td className="p-2.5 text-right font-data-mono text-[#0F4C5C] font-bold">
@@ -3305,7 +3447,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     <input
                       type="date"
                       value={trackingDate}
-                      max={new Date().toISOString().slice(0,10)}
+                      max={getTodayISTDateString()}
                       onChange={(e) => { setTrackingDate(e.target.value); }}
                       className="text-xs p-2 bg-[#F8FAFC] border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#059669]"
                     />
@@ -3334,21 +3476,66 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                 </div>
               )}
 
-              {!trackingLoading && trackingData && (
+              {!trackingLoading && trackingData && (() => {
+                // 'dropped' from the backend lumps Not Interested / Job Seeker / Duplicate
+                // Lead together (they all leave lead_assignments the same way once a
+                // counselor closes them out — see /api/leads/daily-tracking). Each entry
+                // still carries its own final_status, so split them back out client-side
+                // for the categories the user actually wants broken out on this panel.
+                const droppedList = trackingData.categories.dropped || [];
+                const notInterestedList = droppedList.filter(l => l.final_status === 'lost');
+                const jobSeekerList = droppedList.filter(l => l.final_status === 'job_seeker');
+                const duplicateList = droppedList.filter(l => l.final_status === 'duplicate');
+                const connectedCount = trackingData.summary.total - trackingData.summary.notContacted;
+                const categories = { ...trackingData.categories, notInterested: notInterestedList, jobSeeker: jobSeekerList, duplicate: duplicateList };
+
+                const cf = trackingData.cfProgress || { openingCF: 0, cfAhead: 0, cfPending: 0, cfClosedToday: 0, cfOriginalTotal: 0 };
+                const cfAheadTotal = cf.cfAhead + cf.cfClosedToday;
+
+                return (
                 <>
+                  {/* Carry Forward Progress — opening pool for the day vs how much has moved ahead vs is still pending */}
+                  <div className="bg-[#EFF9FF] border-2 border-[#BAE6FD] rounded-xl p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-[#0F4C5C] font-label-caps">Carry Forward Progress — {trackingData.date}</span>
+                        <p className="text-[10px] text-[#40484B] mt-0.5">Contacted leads shunt out of the main (Not Contacted) pool into their own category</p>
+                      </div>
+                      <div className="flex items-center gap-5">
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-amber-600">{cf.cfOriginalTotal}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Opening CF</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-[#1BACE4]">{cfAheadTotal}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Ahead</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-slate-500">{cf.cfPending}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Pending</div>
+                        </div>
+                        <div className="text-center">
+                          <div className="text-lg font-black font-data-mono text-[#0F4C5C]">{connectedCount}</div>
+                          <div className="text-[9px] font-bold uppercase text-slate-500">Connected</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Summary Pills */}
-                  <div className="grid grid-cols-5 gap-3">
+                  <div className="grid grid-cols-3 md:grid-cols-5 lg:grid-cols-9 gap-3">
                     {[
-                      { key: 'all',          label: 'All Activity',    count: trackingData.summary.total,        color: '#505F76', bg: '#F8FAFC',   border: '#CBD5E1' },
-                      { key: 'L1',           label: 'Level 1',         count: trackingData.summary.L1,           color: '#1BACE4', bg: '#EFF9FF',   border: '#BAE6FD' },
-                      { key: 'L2',           label: 'Level 2',         count: trackingData.summary.L2,           color: '#8B5CF6', bg: '#F5F3FF',   border: '#DDD6FE' },
-                      { key: 'L3',           label: 'Level 3',         count: trackingData.summary.L3,           color: '#059669', bg: '#ECFDF5',   border: '#A7F3D0' },
-                      { key: 'interested',   label: 'Interested',      count: trackingData.summary.interested,   color: '#10B981', bg: '#F0FDF4',   border: '#86EFAC' },
-                      { key: 'enrolled',     label: 'Enrolled ✓',      count: trackingData.summary.enrolled,     color: '#0F4C5C', bg: '#F0F9FF',   border: '#7DD3FC' },
-                      { key: 'not_interested', label: 'Not Interested',count: trackingData.summary.not_interested, color: '#EF4444', bg: '#FEF2F2', border: '#FECACA' },
-                      { key: 'not_picked_up',  label: 'Not Picked Up', count: trackingData.summary.not_picked_up,  color: '#F59E0B', bg: '#FFFBEB', border: '#FDE68A' },
-                      { key: 'switched_off',   label: 'Switched Off',  count: trackingData.summary.switched_off,   color: '#64748B', bg: '#F8FAFC', border: '#CBD5E1' },
-                      { key: 'dropped',      label: 'Dropped/Lost',    count: trackingData.summary.dropped,      color: '#BA1A1A', bg: '#FFF1F2',   border: '#FECDD3' },
+                      { key: 'all',            label: 'All Leads',       count: trackingData.summary.total,        color: '#505F76', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'notContacted',   label: 'Not Contacted',   count: trackingData.summary.notContacted, color: '#64748B', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'interested',     label: 'Interested',      count: trackingData.summary.interested,   color: '#10B981', bg: '#F0FDF4',   border: '#86EFAC' },
+                      { key: 'callBack',       label: 'Call Back',      count: trackingData.summary.callBack,     color: '#0D9488', bg: '#F0FDFA',   border: '#99F6E4' },
+                      { key: 'cold',           label: 'Cold',           count: trackingData.summary.cold,         color: '#94A3B8', bg: '#F8FAFC',   border: '#CBD5E1' },
+                      { key: 'notContactable', label: 'Not Contactable', count: trackingData.summary.notContactable, color: '#F59E0B', bg: '#FFFBEB', border: '#FDE68A' },
+                      { key: 'leadPunched',    label: 'Lead Punched',    count: trackingData.summary.leadPunched,  color: '#1BACE4', bg: '#EFF9FF',   border: '#BAE6FD' },
+                      { key: 'enrolled',       label: 'Enrolled ✓',      count: trackingData.summary.enrolled,     color: '#0F4C5C', bg: '#F0F9FF',   border: '#7DD3FC' },
+                      { key: 'notInterested',  label: 'Not Interested',  count: notInterestedList.length,          color: '#EF4444', bg: '#FFF1F2',   border: '#FECDD3' },
+                      { key: 'jobSeeker',      label: 'Job Seeker',      count: jobSeekerList.length,               color: '#FB923C', bg: '#FFF7ED',   border: '#FDBA74' },
+                      { key: 'duplicate',      label: 'Duplicate Lead',  count: duplicateList.length,               color: '#8B5CF6', bg: '#F5F3FF',   border: '#DDD6FE' },
                     ].map(pill => (
                       <button
                         key={pill.key}
@@ -3373,18 +3560,19 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                         <span className="material-symbols-outlined text-sm text-[#059669]">group</span>
                         {
                           trackingCategory === 'all' ? 'All Active Leads' :
-                          trackingCategory === 'L1' ? 'Level 1 Leads' :
-                          trackingCategory === 'L2' ? 'Level 2 Leads' :
-                          trackingCategory === 'L3' ? 'Level 3 Leads' :
+                          trackingCategory === 'notContacted' ? 'Not Contacted Leads' :
                           trackingCategory === 'interested' ? 'Interested Leads' :
+                          trackingCategory === 'callBack' ? 'Call Back Leads' :
+                          trackingCategory === 'cold' ? 'Cold Leads' :
+                          trackingCategory === 'notContactable' ? 'Not Contactable Leads' :
+                          trackingCategory === 'leadPunched' ? 'Lead Punched Leads' :
                           trackingCategory === 'enrolled' ? 'Enrolled Leads' :
-                          trackingCategory === 'not_interested' ? 'Not Interested' :
-                          trackingCategory === 'not_picked_up' ? 'Not Picked Up' :
-                          trackingCategory === 'switched_off' ? 'Switched Off' :
-                          'Dropped / Lost Leads'
+                          trackingCategory === 'notInterested' ? 'Not Interested Leads' :
+                          trackingCategory === 'jobSeeker' ? 'Job Seeker Leads' :
+                          'Duplicate Leads'
                         }
                         <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-data-mono">
-                          {(trackingData.categories[trackingCategory] || []).length} leads
+                          {(categories[trackingCategory] || []).length} leads
                         </span>
                       </h3>
                       <div className="flex items-center gap-2">
@@ -3400,7 +3588,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     </div>
 
                     {(() => {
-                      const rows = (trackingData.categories[trackingCategory] || []).filter(lead => {
+                      const rows = (categories[trackingCategory] || []).filter(lead => {
                         if (!trackingSearch) return true;
                         const q = trackingSearch.toLowerCase();
                         return (
@@ -3433,19 +3621,14 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                 <th className="p-3">Course Interest</th>
                                 <th className="p-3">Company</th>
                                 <th className="p-3">Counselor</th>
-                                <th className="p-3 text-center">Stage</th>
-                                <th className="p-3">Disposition</th>
+                                <th className="p-3 text-center">Status</th>
                                 <th className="p-3">Today's Activity</th>
                                 <th className="p-3">Last Updated</th>
                               </tr>
                             </thead>
                             <tbody className="divide-y divide-[#F0F4F8] font-body-sm">
                               {rows.map(lead => {
-                                const stageColors = { L1: '#1BACE4', L2: '#8B5CF6', L3: '#059669' };
-                                const dispColors = {
-                                  'Interested': '#10B981', 'Not Interested': '#EF4444',
-                                  'Not Picked Up': '#F59E0B', 'Switched Off': '#64748B', 'None': '#CBD5E1'
-                                };
+                                const status = lead.counseling_status || (lead.final_status ? lead.final_status : 'Not Contacted');
                                 return (
                                   <tr key={lead.id} className="hover:bg-[#F8FAFC] transition">
                                     <td className="p-3 pl-4">
@@ -3465,18 +3648,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                       <span className="text-[11px] font-semibold text-[#111C2D]">{lead.counselor_name || '—'}</span>
                                     </td>
                                     <td className="p-3 text-center">
-                                      {lead.stage ? (
-                                        <span className="inline-block px-2 py-0.5 rounded text-white text-[10px] font-bold font-data-mono" style={{ background: stageColors[lead.stage] || '#CBD5E1' }}>
-                                          {lead.stage}
-                                        </span>
-                                      ) : '—'}
-                                    </td>
-                                    <td className="p-3">
-                                      {lead.disposition && lead.disposition !== 'None' ? (
-                                        <span className="text-[10px] font-semibold" style={{ color: dispColors[lead.disposition] || '#505F76' }}>
-                                          {lead.disposition}
-                                        </span>
-                                      ) : <span className="text-[10px] text-[#CBD5E1]">None</span>}
+                                      <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(status).badge}`}>
+                                        {status}
+                                      </span>
                                     </td>
                                     <td className="p-3">
                                       {(lead.activity_today || []).length > 0 ? (
@@ -3507,7 +3681,8 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     })()}
                   </div>
                 </>
-              )}
+                );
+              })()}
             </div>
           )}
 
@@ -3587,7 +3762,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                     <input
                       type="date"
                       value={activityDateTo}
-                      max={new Date().toISOString().slice(0,10)}
+                      max={getTodayISTDateString()}
                       onChange={(e) => setActivityDateTo(e.target.value)}
                       className="w-full text-xs p-2 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#7C3AED]"
                     />
@@ -3843,38 +4018,38 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
 
               {/* Summary Cards */}
               {(() => {
-                const l1Count = managerDroppedLeads.filter(l => l.drop_stage === 'L1').length;
-                const l2Count = managerDroppedLeads.filter(l => l.drop_stage === 'L2').length;
-                const l3Count = managerDroppedLeads.filter(l => l.drop_stage === 'L3').length;
+                const notInterestedCount = managerDroppedLeads.filter(l => l.final_status === 'lost').length;
+                const duplicateCount = managerDroppedLeads.filter(l => l.final_status === 'duplicate').length;
+                const jobSeekerCount = managerDroppedLeads.filter(l => l.final_status === 'job_seeker').length;
                 return (
                   <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                     <div className="bg-white border border-[#CBD5E1] rounded-xl p-4 shadow-sm flex items-center justify-between">
                       <div>
-                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Total Drops</p>
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider font-label-caps">Total Closed</p>
                         <h4 className="text-2xl font-bold text-slate-800 mt-1 font-data-mono">{managerDroppedLeads.length}</h4>
                       </div>
                       <span className="material-symbols-outlined text-3xl text-slate-400">archive</span>
                     </div>
                     <div className="bg-white border border-[#CBD5E1] rounded-xl p-4 shadow-sm flex items-center justify-between">
                       <div>
-                        <p className="text-[10px] font-bold text-orange-600 uppercase tracking-wider font-label-caps">Dropped at L1</p>
-                        <h4 className="text-2xl font-bold text-orange-600 mt-1 font-data-mono">{l1Count}</h4>
+                        <p className="text-[10px] font-bold text-red-600 uppercase tracking-wider font-label-caps">Not Interested</p>
+                        <h4 className="text-2xl font-bold text-red-600 mt-1 font-data-mono">{notInterestedCount}</h4>
                       </div>
-                      <span className="material-symbols-outlined text-3xl text-orange-400 font-bold">arrow_forward</span>
+                      <span className="material-symbols-outlined text-3xl text-red-400 font-bold">thumb_down</span>
                     </div>
                     <div className="bg-white border border-[#CBD5E1] rounded-xl p-4 shadow-sm flex items-center justify-between">
                       <div>
-                        <p className="text-[10px] font-bold text-blue-600 uppercase tracking-wider font-label-caps">Dropped at L2</p>
-                        <h4 className="text-2xl font-bold text-blue-600 mt-1 font-data-mono">{l2Count}</h4>
+                        <p className="text-[10px] font-bold text-purple-600 uppercase tracking-wider font-label-caps">Duplicate Lead</p>
+                        <h4 className="text-2xl font-bold text-purple-600 mt-1 font-data-mono">{duplicateCount}</h4>
                       </div>
-                      <span className="material-symbols-outlined text-3xl text-blue-400 font-bold">arrow_forward</span>
+                      <span className="material-symbols-outlined text-3xl text-purple-400 font-bold">content_copy</span>
                     </div>
                     <div className="bg-white border border-[#CBD5E1] rounded-xl p-4 shadow-sm flex items-center justify-between">
                       <div>
-                        <p className="text-[10px] font-bold text-purple-600 uppercase tracking-wider font-label-caps">Dropped at L3</p>
-                        <h4 className="text-2xl font-bold text-purple-600 mt-1 font-data-mono">{l3Count}</h4>
+                        <p className="text-[10px] font-bold text-orange-600 uppercase tracking-wider font-label-caps">Job Seeker</p>
+                        <h4 className="text-2xl font-bold text-orange-600 mt-1 font-data-mono">{jobSeekerCount}</h4>
                       </div>
-                      <span className="material-symbols-outlined text-3xl text-purple-400 font-bold">arrow_forward</span>
+                      <span className="material-symbols-outlined text-3xl text-orange-400 font-bold">work</span>
                     </div>
                   </div>
                 );
@@ -3918,9 +4093,8 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                               <th className="p-3 pl-4">Candidate</th>
                               <th className="p-3">Phone</th>
                               <th className="p-3">Assigned Counselor</th>
-                              <th className="p-3">Stage Dropped At</th>
+                              <th className="p-3">Closed Status</th>
                               <th className="p-3">Course</th>
-                              <th className="p-3">Drop Status/Reason</th>
                               <th className="p-3">Remarks</th>
                               <th className="p-3 pr-4">Dropped Date</th>
                             </tr>
@@ -3935,26 +4109,24 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                 <td className="p-3 text-slate-600 font-data-mono"><MaskedPhone phone={lead.phone} /></td>
                                 <td className="p-3 font-semibold text-slate-700">{lead.counselor_name || <span className="text-slate-400 italic">Unassigned</span>}</td>
                                 <td className="p-3">
-                                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                    lead.drop_stage === 'L1' ? 'bg-orange-100 text-orange-700' :
-                                    lead.drop_stage === 'L2' ? 'bg-blue-100 text-blue-700' :
-                                    'bg-purple-100 text-purple-700'
-                                  }`}>
-                                    {lead.drop_stage || 'Unknown'}
+                                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${getStatusStyle(lead.drop_stage).badge}`}>
+                                    {lead.drop_stage || lead.final_status || 'Unknown'}
                                   </span>
                                 </td>
                                 <td className="p-3">{lead.course_interest || '—'}</td>
-                                <td className="p-3">
-                                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                    lead.status === 'invalid' ? 'bg-red-100 text-red-700' :
-                                    lead.status === 'duplicate' ? 'bg-amber-100 text-amber-700' :
-                                    'bg-slate-100 text-slate-700'
-                                  }`}>
-                                    {lead.status || 'closed'}
-                                  </span>
-                                </td>
-                                <td className="p-3 max-w-[300px] truncate text-slate-600 font-normal italic" title={lead.drop_remark}>
-                                  {lead.drop_remark || 'No remark provided'}
+                                <td className="p-3 max-w-[300px]">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="truncate text-slate-600 font-normal italic" title={lead.drop_remark}>
+                                      {lead.drop_remark || 'No remark provided'}
+                                    </span>
+                                    <button
+                                      onClick={() => setRemarksModalLead(lead)}
+                                      className="shrink-0 text-slate-400 hover:text-[#1BACE4]"
+                                      title="View all remarks"
+                                    >
+                                      <span className="material-symbols-outlined text-sm">forum</span>
+                                    </button>
+                                  </div>
                                 </td>
                                 <td className="p-3 pr-4 text-[10px] text-slate-500 font-data-mono">
                                   {lead.closed_at
@@ -4010,12 +4182,11 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                       // Generate CSV Export
                       const headers = [
                         'Lead ID', 'Candidate Name', 'Phone', 'Email', 'City', 'State', 'Course Interest', 'Source', 'Target University',
-                        'L1 Qualified Date', 'L1 Counselor', 'L1 Remarks',
-                        'L2 Punch Date', 'L2 Counselor', 'L2 Remarks',
-                        'L3 Reg Date', 'L3 Reg Counselor', 'L3 Reg Remarks',
-                        'L3 Docs Verified Date', 'L3 Docs Counselor', 'L3 Docs Remarks',
-                        'L3 Fees/Closure Date', 'L3 Fees Counselor', 'L3 Fees Remarks',
-                        'Final Status', 'Closed Revenue', 'Drop Stage', 'Drop Reason/Remarks'
+                        'Status Changed Date', 'Status Changed By', 'Status Change Remark',
+                        'Registered Date', 'Registered By', 'Registration Remark',
+                        'Fee Update Date', 'Fee Update By', 'Fee Update Remark',
+                        'Final Outcome Date', 'Final Outcome By', 'Final Outcome Remark',
+                        'Final Status', 'Closed Revenue', 'Drop Reason', 'Drop Remarks'
                       ];
 
                       const rows = decompositions.map(j => {
@@ -4024,7 +4195,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           const str = String(val).replace(/"/g, '""');
                           return `"${str}"`;
                         };
-                        
+
                         const formatDate = (ts) => {
                           if (!ts) return '';
                           return new Date(ts).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -4040,21 +4211,18 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           escapeCSV(j.course_interest),
                           escapeCSV(j.source),
                           escapeCSV(j.university_name),
-                          escapeCSV(formatDate(j.l1?.date)),
-                          escapeCSV(j.l1?.counselor),
-                          escapeCSV(j.l1?.remark),
-                          escapeCSV(formatDate(j.l2?.date)),
-                          escapeCSV(j.l2?.counselor),
-                          escapeCSV(j.l2?.remark),
-                          escapeCSV(formatDate(j.l3_reg?.date)),
-                          escapeCSV(j.l3_reg?.counselor),
-                          escapeCSV(j.l3_reg?.remark),
-                          escapeCSV(formatDate(j.l3_docs?.date)),
-                          escapeCSV(j.l3_docs?.counselor),
-                          escapeCSV(j.l3_docs?.remark),
-                          escapeCSV(formatDate(j.l3_fees?.date)),
-                          escapeCSV(j.l3_fees?.counselor),
-                          escapeCSV(j.l3_fees?.remark),
+                          escapeCSV(formatDate(j.statusChange?.date)),
+                          escapeCSV(j.statusChange?.counselor),
+                          escapeCSV(j.statusChange?.remark),
+                          escapeCSV(formatDate(j.registered?.date)),
+                          escapeCSV(j.registered?.counselor),
+                          escapeCSV(j.registered?.remark),
+                          escapeCSV(formatDate(j.feeUpdate?.date)),
+                          escapeCSV(j.feeUpdate?.counselor),
+                          escapeCSV(j.feeUpdate?.remark),
+                          escapeCSV(formatDate(j.finalOutcome?.date)),
+                          escapeCSV(j.finalOutcome?.counselor),
+                          escapeCSV(j.finalOutcome?.remark),
                           escapeCSV(j.final_status),
                           escapeCSV(j.closure_revenue),
                           escapeCSV(j.drop_stage),
@@ -4113,11 +4281,10 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                         (j.course_interest || '').toLowerCase().includes(q) ||
                         (j.source || '').toLowerCase().includes(q) ||
                         (j.university_name || '').toLowerCase().includes(q) ||
-                        (j.l1?.counselor || '').toLowerCase().includes(q) ||
-                        (j.l2?.counselor || '').toLowerCase().includes(q) ||
-                        (j.l3_reg?.counselor || '').toLowerCase().includes(q) ||
-                        (j.l3_docs?.counselor || '').toLowerCase().includes(q) ||
-                        (j.l3_fees?.counselor || '').toLowerCase().includes(q)
+                        (j.statusChange?.counselor || '').toLowerCase().includes(q) ||
+                        (j.registered?.counselor || '').toLowerCase().includes(q) ||
+                        (j.feeUpdate?.counselor || '').toLowerCase().includes(q) ||
+                        (j.finalOutcome?.counselor || '').toLowerCase().includes(q)
                       );
                     });
 
@@ -4135,26 +4302,27 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <thead className="bg-[#F8FAFC] border-b border-[#E2E8F0]">
                             <tr className="text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps border-b border-[#E2E8F0]">
                               <th className="p-3 pl-4 border-r border-[#E2E8F0]" colSpan={3}>Lead Overview</th>
-                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={2}>L1 Qualification</th>
-                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={2}>L2 Lead Punch</th>
-                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={6}>L3 Onboarding milestones</th>
+                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={2}>Status Change</th>
+                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={2}>Registration</th>
+                              <th className="p-3 text-center border-r border-[#E2E8F0]" colSpan={2}>Fee Update</th>
+                              <th className="p-3 text-center" colSpan={3}>Final Outcome</th>
                             </tr>
                             <tr className="text-[9px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps bg-[#F1F5F9]">
                               <th className="p-2 pl-4">Candidate</th>
                               <th className="p-2">Course / Source</th>
                               <th className="p-2 border-r border-[#CBD5E1]">University</th>
-                              
-                              <th className="p-2 text-center">Qualified Date</th>
-                              <th className="p-2 border-r border-[#CBD5E1]">L1 Counselor</th>
-                              
-                              <th className="p-2 text-center">Punched Date</th>
-                              <th className="p-2 border-r border-[#CBD5E1]">L2 Counselor</th>
-                              
-                              <th className="p-2 text-center">Reg Date</th>
-                              <th className="p-2 text-center">Docs Date</th>
-                              <th className="p-2 text-center">Fees Date</th>
-                              <th className="p-2">L3 Counselor</th>
+
+                              <th className="p-2 text-center">Date</th>
+                              <th className="p-2 border-r border-[#CBD5E1]">Counselor</th>
+
+                              <th className="p-2 text-center">Date</th>
+                              <th className="p-2 border-r border-[#CBD5E1]">Counselor</th>
+
+                              <th className="p-2 text-center">Date</th>
+                              <th className="p-2 border-r border-[#CBD5E1]">Counselor</th>
+
                               <th className="p-2">Final Status</th>
+                              <th className="p-2">Counselor</th>
                               <th className="p-2 pr-4">Revenue</th>
                             </tr>
                           </thead>
@@ -4181,25 +4349,25 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                     <span className="font-semibold text-slate-700">{j.university_name || '—'}</span>
                                   </td>
 
-                                  {/* L1 Qualification */}
-                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.l1?.date)}</td>
-                                  <td className="p-3 border-r border-[#E2E8F0] text-center font-medium text-slate-600" title={j.l1?.remark}>
-                                    {j.l1?.counselor || '—'}
+                                  {/* Status Change */}
+                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.statusChange?.date)}</td>
+                                  <td className="p-3 border-r border-[#E2E8F0] text-center font-medium text-slate-600" title={j.statusChange?.remark}>
+                                    {j.statusChange?.counselor || '—'}
                                   </td>
 
-                                  {/* L2 Punch */}
-                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.l2?.date)}</td>
-                                  <td className="p-3 border-r border-[#E2E8F0] text-center font-medium text-slate-600" title={j.l2?.remark}>
-                                    {j.l2?.counselor || '—'}
+                                  {/* Registration */}
+                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.registered?.date)}</td>
+                                  <td className="p-3 border-r border-[#E2E8F0] text-center font-medium text-slate-600" title={j.registered?.remark}>
+                                    {j.registered?.counselor || '—'}
                                   </td>
 
-                                  {/* L3 Milestones */}
-                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.l3_reg?.date)}</td>
-                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.l3_docs?.date)}</td>
-                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.l3_fees?.date)}</td>
-                                  <td className="p-3 font-medium text-slate-600">
-                                    {j.l3_fees?.counselor || j.l3_docs?.counselor || j.l3_reg?.counselor || '—'}
+                                  {/* Fee Update */}
+                                  <td className="p-3 text-center text-slate-500 font-data-mono text-[10px]">{formatDate(j.feeUpdate?.date)}</td>
+                                  <td className="p-3 border-r border-[#E2E8F0] text-center font-medium text-slate-600" title={j.feeUpdate?.remark}>
+                                    {j.feeUpdate?.counselor || '—'}
                                   </td>
+
+                                  {/* Final Outcome */}
                                   <td className="p-3">
                                     {j.final_status ? (
                                       <span className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase ${
@@ -4212,6 +4380,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                                         In Progress
                                       </span>
                                     )}
+                                  </td>
+                                  <td className="p-3 font-medium text-slate-600" title={j.finalOutcome?.remark}>
+                                    {j.finalOutcome?.counselor || '—'}
                                   </td>
                                   <td className="p-3 pr-4 font-bold text-[#059669] font-data-mono">
                                     {j.closure_revenue ? `₹${j.closure_revenue.toLocaleString()}` : '—'}
@@ -4287,8 +4458,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                             <th className="p-3 pl-4">Candidate</th>
                             <th className="p-3">Phone</th>
                             <th className="p-3">Escalated By</th>
-                            <th className="p-3">Stage</th>
-                            <th className="p-3">Disposition</th>
+                            <th className="p-3">Status</th>
                             <th className="p-3">Escalation Remark</th>
                             <th className="p-3">Date Escalated</th>
                             <th className="p-3 pr-4 text-center">Manager Action</th>
@@ -4306,13 +4476,23 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                               </td>
                               <td className="p-3 font-semibold text-slate-700">{lead.counselor_name}</td>
                               <td className="p-3">
-                                <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#E6F8FE] text-[#1BACE4] border border-[#1BACE4]/20">
-                                  {lead.stage}
+                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(lead.counseling_status).badge}`}>
+                                  {lead.counseling_status || 'Not Contacted'}
                                 </span>
                               </td>
-                              <td className="p-3 font-semibold">{lead.disposition || 'None'}</td>
-                              <td className="p-3 max-w-[250px] truncate text-slate-600 font-normal italic" title={lead.forward_remark}>
-                                {lead.forward_remark || 'No remark'}
+                              <td className="p-3 max-w-[250px]">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="truncate text-slate-600 font-normal italic" title={lead.forward_remark}>
+                                    {lead.forward_remark || 'No remark'}
+                                  </span>
+                                  <button
+                                    onClick={() => setRemarksModalLead(lead)}
+                                    className="shrink-0 text-slate-400 hover:text-[#1BACE4]"
+                                    title="View all remarks"
+                                  >
+                                    <span className="material-symbols-outlined text-sm">forum</span>
+                                  </button>
+                                </div>
                               </td>
                               <td className="p-3 text-[10px] text-slate-500 font-data-mono">
                                 {lead.forwarded_at
@@ -4590,8 +4770,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <th className="p-3">Location</th>
                           <th className="p-3">Experience</th>
                           <th className="p-3">Course / University</th>
-                          <th className="p-3 text-center">Stage</th>
-                          <th className="p-3 text-center">Disposition</th>
+                          <th className="p-3 text-center">Status</th>
                           <th className="p-3">Last Activity Date</th>
                         </tr>
                       </thead>
@@ -4612,20 +4791,9 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                               )}
                             </td>
                             <td className="p-3 text-center">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                lead.stage === 'L1' ? 'bg-slate-100 text-slate-700' :
-                                lead.stage === 'L2' ? 'bg-amber-100 text-amber-700 font-medium' :
-                                'bg-green-100 text-green-700'
-                              }`}>
-                                {lead.stage}
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${getStatusStyle(lead.counseling_status).badge}`}>
+                                {lead.counseling_status || 'Not Contacted'}
                               </span>
-                            </td>
-                            <td className="p-3 text-center">
-                              {lead.disposition && lead.disposition !== 'None' ? (
-                                <span className="text-[10px] font-bold text-[#0F4C5C] bg-[#EFF9FF] px-2 py-0.5 rounded-full">
-                                  {lead.disposition}
-                                </span>
-                              ) : <span className="text-slate-400 italic text-[10px]">None</span>}
                             </td>
                             <td className="p-3 text-[10px] text-[#70787C] font-data-mono">
                               {lead.assigned_updated_at ? new Date(lead.assigned_updated_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
@@ -4652,6 +4820,10 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
         </div>
       )}
 
+      {remarksModalLead && (
+        <RemarksModal token={token} lead={remarksModalLead} onClose={() => setRemarksModalLead(null)} />
+      )}
+
       {/* ESCALATION RESOLUTION MODAL */}
       {resolveModalLead && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40 p-4">
@@ -4664,7 +4836,7 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
               
               <div className="text-xs space-y-1.5 bg-[#F8FAFC] p-3 rounded-lg border border-[#E2E8F0]">
                 <div><span className="font-bold text-slate-700">Forwarded By:</span> {resolveModalLead.counselor_name}</div>
-                <div><span className="font-bold text-slate-700">Original Stage:</span> {resolveModalLead.stage}</div>
+                <div><span className="font-bold text-slate-700">Current Status:</span> {resolveModalLead.counseling_status}</div>
                 <div><span className="font-bold text-slate-700">Escalation Reason:</span> <span className="italic text-slate-650">"{resolveModalLead.forward_remark || 'None'}"</span></div>
               </div>
 
