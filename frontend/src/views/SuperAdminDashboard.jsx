@@ -21,6 +21,8 @@ import React, { useState, useEffect } from 'react';
 import ManagerDashboard from './ManagerDashboard';
 import HiringAdminDashboard from '../modules/hiring/dashboards/HiringAdminDashboard';
 import { hiringApi } from '../modules/hiring/services/hiringApi';
+import { COUNSELING_STATUSES, getStatusStyle } from '../utils/statusStyles';
+import RedistributeLeadsPanel from '../components/RedistributeLeadsPanel';
 
 const ADMISSIONS_ROLES = ['counselor', 'team_leader', 'manager', 'super_admin'];
 const HIRING_ROLES = ['recruiter', 'hiring_team_leader'];
@@ -32,6 +34,60 @@ const SkillLabsLogo = ({ className = '' }) => (
     <text x="92" y="38" fontFamily="system-ui, -apple-system, sans-serif" fontWeight="300" fontSize="38" fill="#F7941D" letterSpacing="-1.5">Labs</text>
   </svg>
 );
+
+const MaskedPhone = ({ phone }) => {
+  const [revealed, setRevealed] = useState(false);
+
+  if (!phone) return <span className="text-slate-400 italic">No phone</span>;
+
+  const mask = (p) => {
+    const clean = p.replace(/\s+/g, '');
+    if (clean.length <= 4) return '****';
+    return clean.slice(0, 2) + '*'.repeat(clean.length - 4) + clean.slice(-2);
+  };
+
+  return (
+    <span
+      onClick={() => setRevealed(!revealed)}
+      className="cursor-pointer font-data-mono hover:text-[#1BACE4] transition select-none inline-flex items-center gap-1 group"
+      title="Click to reveal phone number"
+    >
+      <span className="material-symbols-outlined text-[14px] text-slate-400 group-hover:text-[#1BACE4] transition">
+        {revealed ? 'visibility' : 'visibility_off'}
+      </span>
+      <span>{revealed ? phone : mask(phone)}</span>
+    </span>
+  );
+};
+
+const MaskedEmail = ({ email }) => {
+  const [revealed, setRevealed] = useState(false);
+
+  if (!email) return <span className="text-slate-400 italic">No email</span>;
+
+  const maskEmail = (str) => {
+    const parts = str.split('@');
+    if (parts.length !== 2) return str;
+    const [user, domain] = parts;
+    if (user.length <= 2) {
+      return user[0] + '*' + '@' + domain;
+    }
+    return user[0] + '*'.repeat(user.length - 2) + user.slice(-1) + '@' + domain;
+  };
+
+  return (
+    <span
+      onClick={() => setRevealed(!revealed)}
+      className="cursor-pointer font-data-mono hover:text-[#1BACE4] transition select-none inline-flex items-center gap-1 group"
+      title="Click to reveal email"
+    >
+      <span className="material-symbols-outlined text-[14px] text-slate-400 group-hover:text-[#1BACE4] transition">
+        {revealed ? 'visibility' : 'visibility_off'}
+      </span>
+      <span>{revealed ? email : maskEmail(email)}</span>
+    </span>
+  );
+};
 
 export default function SuperAdminDashboard({ token, user, onLogout }) {
   const [activeTab, setActiveTab] = useState('audit'); // audit, users, protocols, repository, universities
@@ -117,6 +173,16 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
   // Repository stats state
   const [repoStats, setRepoStats] = useState({ leads: 0, raw: 0, clean: 0, duplicate: 0, invalid: 0 });
 
+  // Master Repository leads table (search/filter) — mirrors ManagerDashboard's Master
+  // Repository tab so Super Admin can inspect/search all system data (incl. Source) directly,
+  // without switching into the Manager view.
+  const [masterLeads, setMasterLeads] = useState([]);
+  const [masterLeadsLoading, setMasterLeadsLoading] = useState(false);
+  const [repoCounselorsList, setRepoCounselorsList] = useState([]);
+  const [repoSearch, setRepoSearch] = useState('');
+  const [repoCounselorFilter, setRepoCounselorFilter] = useState('');
+  const [repoStageFilter, setRepoStageFilter] = useState('');
+
   // Universities Management State
   const [universitiesList, setUniversitiesList] = useState([]);
   const [uniName, setUniName] = useState('');
@@ -144,6 +210,10 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
       // transaction logs" empty state) silently filtered by whatever the Audit tab's
       // dropdown happened to be set to, even though that filter isn't shown on this tab.
       fetchLogs(true);
+      fetchMasterLeads();
+      fetchRepoCounselors();
+    } else if (activeTab === 'redistribute') {
+      fetchRepoCounselors();
     } else if (activeTab === 'universities') {
       fetchUniversities();
     }
@@ -243,6 +313,61 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
       console.error(err);
     }
   };
+
+  const fetchMasterLeads = async () => {
+    setMasterLeadsLoading(true);
+    try {
+      const response = await fetch('/api/leads/master', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setMasterLeads(data);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setMasterLeadsLoading(false);
+    }
+  };
+
+  const fetchRepoCounselors = async () => {
+    try {
+      const response = await fetch('/api/users/counselors', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setRepoCounselorsList(data);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const repositoryFilteredLeads = masterLeads.filter(lead => {
+    if (repoSearch) {
+      const s = repoSearch.toLowerCase();
+      const matches =
+        (lead.name || '').toLowerCase().includes(s) ||
+        (lead.phone || '').includes(s) ||
+        (lead.email || '').toLowerCase().includes(s) ||
+        (lead.city || '').toLowerCase().includes(s) ||
+        (lead.source || '').toLowerCase().includes(s);
+      if (!matches) return false;
+    }
+    if (repoCounselorFilter && lead.counselor_id !== repoCounselorFilter) {
+      return false;
+    }
+    if (repoStageFilter) {
+      if (repoStageFilter === 'unassigned') {
+        if (lead.counselor_id) return false;
+      } else if (lead.counseling_status !== repoStageFilter) {
+        return false;
+      }
+    }
+    return true;
+  });
 
   const handleCreateUser = async (e) => {
     e.preventDefault();
@@ -609,14 +734,21 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
               <span className="material-symbols-outlined text-lg">enhanced_encryption</span>
               <span>Security Protocols</span>
             </button>
-            <button 
+            <button
               onClick={(e) => handleTabClick(setActiveTab, 'repository', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded text-white transition duration-150 active:scale-95 ${activeTab === 'repository' ? 'bg-[#1BACE4]' : 'hover:bg-white/5'}`}
             >
               <span className="material-symbols-outlined text-lg">database</span>
               <span>Data Repository</span>
             </button>
-            <button 
+            <button
+              onClick={(e) => handleTabClick(setActiveTab, 'redistribute', e)}
+              className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded text-white transition duration-150 active:scale-95 ${activeTab === 'redistribute' ? 'bg-[#8B5CF6]' : 'hover:bg-white/5'}`}
+            >
+              <span className="material-symbols-outlined text-lg">swap_horiz</span>
+              <span>Redistribute Leads</span>
+            </button>
+            <button
               onClick={(e) => handleTabClick(setActiveTab, 'universities', e)}
               className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded text-white transition duration-150 active:scale-95 ${activeTab === 'universities' ? 'bg-[#1BACE4]' : 'hover:bg-white/5'}`}
             >
@@ -1187,6 +1319,134 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
                 </div>
               </div>
 
+              {/* All System Data Workspace — full leads table, incl. Source, search & filters */}
+              <div className="bg-white border border-[#E2E8F0] rounded overflow-hidden shadow-sm">
+                <div className="p-4 border-b border-[#E2E8F0] flex flex-wrap items-center justify-between gap-3 bg-[#F8FAFC]">
+                  <div>
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-[#111C2D] font-label-caps flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-[#0F4C5C]">dataset</span>
+                      All System Data Workspace
+                    </h3>
+                    <p className="text-[10px] text-slate-500 font-medium mt-0.5">
+                      Showing {repositoryFilteredLeads.length} of {masterLeads.length} total leads
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-1.5 bg-white border border-[#CBD5E1] px-2.5 py-1.5 rounded-lg">
+                      <span className="material-symbols-outlined text-[#70787C] text-sm">search</span>
+                      <input
+                        type="text"
+                        placeholder="Search name, phone, city, source..."
+                        value={repoSearch}
+                        onChange={(e) => setRepoSearch(e.target.value)}
+                        className="text-xs focus:outline-none w-52 font-body-sm bg-white"
+                      />
+                      {repoSearch && (
+                        <button onClick={() => setRepoSearch('')} className="text-slate-400 hover:text-red-500 flex items-center">
+                          <span className="material-symbols-outlined text-sm">close</span>
+                        </button>
+                      )}
+                    </div>
+
+                    <select
+                      value={repoCounselorFilter}
+                      onChange={(e) => setRepoCounselorFilter(e.target.value)}
+                      className="text-xs p-2 bg-white border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#0F4C5C]"
+                    >
+                      <option value="">All Counselors</option>
+                      {repoCounselorsList.map(c => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
+
+                    <select
+                      value={repoStageFilter}
+                      onChange={(e) => setRepoStageFilter(e.target.value)}
+                      className="text-xs p-2 bg-white border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#0F4C5C]"
+                    >
+                      <option value="">All Statuses</option>
+                      <option value="unassigned">Unassigned Pool</option>
+                      {COUNSELING_STATUSES.map(s => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps">
+                        <th className="p-3">Data Name</th>
+                        <th className="p-3">Masked Phone</th>
+                        <th className="p-3">Email</th>
+                        <th className="p-3">City/State</th>
+                        <th className="p-3">Source</th>
+                        <th className="p-3">Owner Counselor</th>
+                        <th className="p-3">Counseling Status</th>
+                        <th className="p-3">Data Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#E2E8F0] text-xs font-body-sm text-[#111C2D]">
+                      {masterLeadsLoading ? (
+                        <tr>
+                          <td colSpan="8" className="p-8 text-center text-[#70787C] italic">Loading system data...</td>
+                        </tr>
+                      ) : repositoryFilteredLeads.length === 0 ? (
+                        <tr>
+                          <td colSpan="8" className="p-8 text-center text-[#70787C] italic">
+                            No leads match your search and filter criteria.
+                          </td>
+                        </tr>
+                      ) : (
+                        repositoryFilteredLeads.map(lead => (
+                          <tr key={lead.id} className="hover:bg-[#F1F5F9] transition">
+                            <td className="p-3 font-semibold text-[#0F4C5C]">{lead.name}</td>
+                            <td className="p-3 font-data-mono"><MaskedPhone phone={lead.phone} /></td>
+                            <td className="p-3 font-data-mono"><MaskedEmail email={lead.email} /></td>
+                            <td className="p-3">{lead.city && lead.state ? `${lead.city}, ${lead.state}` : (lead.city || lead.state || '—')}</td>
+                            <td className="p-3">
+                              <span className="px-1.5 py-0.5 bg-[#F0F3FF] border border-[#E7EEFF] rounded text-[10px] font-medium text-[#0F4C5C]">
+                                {lead.source}
+                              </span>
+                            </td>
+                            <td className="p-3 font-medium text-slate-700">
+                              {lead.counselor_name ? (
+                                <span className="flex items-center gap-1">
+                                  <span className="material-symbols-outlined text-sm text-[#0F4C5C]">person</span>
+                                  {lead.counselor_name}
+                                </span>
+                              ) : (
+                                <span className="text-xs text-slate-400 italic">Unassigned</span>
+                              )}
+                            </td>
+                            <td className="p-3">
+                              {lead.counseling_status ? (
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(lead.counseling_status).badge}`}>
+                                  {lead.counseling_status}
+                                </span>
+                              ) : (
+                                <span className="text-xs text-slate-400 italic">None</span>
+                              )}
+                            </td>
+                            <td className="p-3">
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium uppercase ${
+                                lead.status === 'clean' ? 'text-green-600 bg-green-50 border border-green-200' :
+                                lead.status === 'duplicate' ? 'text-amber-600 bg-amber-50 border border-amber-200' :
+                                'text-red-600 bg-red-50 border border-red-200'
+                              }`}>
+                                {lead.status}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
               {/* Data Export logs list */}
               <div className="bg-white border border-[#E2E8F0] rounded overflow-hidden shadow-sm">
                 <div className="p-4 border-b border-[#E2E8F0] bg-[#F8FAFC]">
@@ -1230,6 +1490,16 @@ export default function SuperAdminDashboard({ token, user, onLogout }) {
               </div>
 
             </div>
+          )}
+
+          {/* TAB: REDISTRIBUTE WORKED LEADS */}
+          {activeTab === 'redistribute' && (
+            <RedistributeLeadsPanel
+              token={token}
+              counselors={repoCounselorsList}
+              triggerCelebration={triggerCelebration}
+              onChanged={() => { fetchRepoCounselors(); fetchMasterLeads(); fetchRepositoryStats(); }}
+            />
           )}
 
           {activeTab === 'universities' && (

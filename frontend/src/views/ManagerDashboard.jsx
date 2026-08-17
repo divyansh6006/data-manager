@@ -298,6 +298,21 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   // L3 students search query
   const [l3SearchQuery, setL3SearchQuery] = useState('');
 
+  // Redistribute Leads state — bulk-reassign an already-worked counselor's leads onto one
+  // or more other counselors (distinct from Distribute, which only pulls from the raw
+  // unassigned pool), plus a "Reassignment History" sub-view showing each redistributed
+  // lead's full ownership pathway.
+  const [redistributeSubView, setRedistributeSubView] = useState('allocate'); // 'allocate' | 'history'
+  const [redistributeSourceCounselorId, setRedistributeSourceCounselorId] = useState('');
+  const [redistributeStatusFilters, setRedistributeStatusFilters] = useState([]); // [] = all statuses
+  const [redistributePool, setRedistributePool] = useState([]);
+  const [redistributePoolLoading, setRedistributePoolLoading] = useState(false);
+  const [redistributeAllocations, setRedistributeAllocations] = useState({}); // counselorId -> count
+  const [redistributionHistory, setRedistributionHistory] = useState([]);
+  const [redistributionHistoryLoading, setRedistributionHistoryLoading] = useState(false);
+  const [redistributionHistorySearch, setRedistributionHistorySearch] = useState('');
+  const [expandedPathLeadId, setExpandedPathLeadId] = useState(null);
+
   // Load counselors, leads, metrics, transfer requests, and location learnings
   useEffect(() => {
     fetchCounselors();
@@ -323,7 +338,21 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
     if (activeTab === 'decompositions') {
       fetchDecompositions();
     }
+    if (activeTab === 'redistribute') {
+      fetchRedistributionHistory();
+    }
   }, [activeTab]);
+
+  // Re-fetch the source counselor's active leads whenever the chosen counselor or status
+  // filter changes, so "matched pool" always reflects what's actually about to be moved.
+  useEffect(() => {
+    if (activeTab === 'redistribute' && redistributeSourceCounselorId) {
+      fetchRedistributePool(redistributeSourceCounselorId);
+    } else {
+      setRedistributePool([]);
+    }
+    setRedistributeAllocations({});
+  }, [activeTab, redistributeSourceCounselorId]);
 
   useEffect(() => {
     if (activeTab === 'decompositions') {
@@ -866,6 +895,45 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
     }
   };
 
+  const fetchRedistributePool = async (counselorId) => {
+    setRedistributePoolLoading(true);
+    try {
+      const response = await fetch(`/api/leads/master?counselor_id=${counselorId}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (response.ok) {
+        // counselor_id also matches leads this counselor CLOSED (via closures), which have
+        // no counseling_status left to move — only currently-active assignments are
+        // redistributable.
+        setRedistributePool(data.filter(l => l.counseling_status != null));
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setRedistributePoolLoading(false);
+    }
+  };
+
+  const fetchRedistributionHistory = async () => {
+    setRedistributionHistoryLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (redistributionHistorySearch) params.append('search', redistributionHistorySearch);
+      const response = await fetch(`/api/leads/redistribution-history?${params.toString()}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setRedistributionHistory(data);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setRedistributionHistoryLoading(false);
+    }
+  };
+
   const fetchMetrics = async () => {
     try {
       const response = await fetch('/api/reports/data-status', {
@@ -1130,6 +1198,67 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const totalPoolAvailable = poolLeads.length;
   const remainingInPool = totalPoolAvailable - totalAllocated;
 
+  // Redistribute Leads — allocation handlers
+  const toggleRedistributeStatusFilter = (status) => {
+    setRedistributeStatusFilters(prev =>
+      prev.includes(status) ? prev.filter(s => s !== status) : [...prev, status]
+    );
+  };
+
+  const handleRedistributeAllocChange = (counselorId, val) => {
+    const intVal = Math.max(0, parseInt(val, 10) || 0);
+    setRedistributeAllocations(prev => ({ ...prev, [counselorId]: intVal }));
+  };
+
+  const redistributeMatched = redistributePool.filter(l =>
+    redistributeStatusFilters.length === 0 || redistributeStatusFilters.includes(l.counseling_status)
+  );
+  const redistributeTargetCounselors = counselors.filter(c => c.id !== redistributeSourceCounselorId);
+  const redistributeTotalAllocated = Object.values(redistributeAllocations).reduce((sum, val) => sum + val, 0);
+  const redistributeMatchedCount = redistributeMatched.length;
+  const redistributeRemaining = redistributeMatchedCount - redistributeTotalAllocated;
+
+  const handleRedistribute = async () => {
+    const finalAllocations = Object.keys(redistributeAllocations)
+      .map(cid => ({ counselorId: cid, count: redistributeAllocations[cid] }))
+      .filter(a => a.count > 0);
+
+    if (finalAllocations.length === 0) return;
+
+    try {
+      const response = await fetch('/api/leads/redistribute', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          sourceCounselorId: redistributeSourceCounselorId,
+          counselingStatuses: redistributeStatusFilters,
+          allocations: finalAllocations
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        alert(data.error || 'Redistribution failed');
+      } else {
+        triggerCelebration('Leads Redistributed! 🔄');
+        alert(data.message);
+        fetchCounselors();
+        fetchMasterLeads();
+        fetchMetrics();
+        fetchRedistributePool(redistributeSourceCounselorId);
+        fetchRedistributionHistory();
+        setRedistributeAllocations({});
+      }
+    } catch (err) {
+      console.error(err);
+      alert('Error during lead redistribution');
+    }
+  };
+
   // Security prevention handler
   const handleSecurityBlock = (e) => {
     e.preventDefault();
@@ -1225,6 +1354,14 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
             >
               <span className="material-symbols-outlined text-lg">group_work</span>
               <span>Data Distribution</span>
+            </button>
+            <button
+              onClick={(e) => handleTabClick(setActiveTab, 'redistribute', e)}
+              className={`w-full flex items-center gap-3 px-3 py-2 text-xs font-semibold rounded hover-sidebar-item transition duration-150 active:scale-95 ${activeTab === 'redistribute' ? 'text-white' : 'text-slate-300 hover:bg-white/10'}`}
+              style={activeTab === 'redistribute' ? { background: '#8B5CF6' } : {}}
+            >
+              <span className="material-symbols-outlined text-lg">swap_horiz</span>
+              <span>Redistribute Leads</span>
             </button>
             <button
               onClick={(e) => handleTabClick(setActiveTab, 'repository', e)}
@@ -1999,6 +2136,264 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                           <li><strong>Load balance:</strong> Compare proposed loads to ensure fair counselor roster work shares.</li>
                         </ul>
                       </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* REDISTRIBUTE WORKED LEADS VIEW */}
+          {activeTab === 'redistribute' && (
+            <div className="space-y-6">
+              <div className="bg-white border border-[#E2E8F0] p-6 rounded w-full">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#E2E8F0] pb-3 mb-6">
+                  <h2 className="text-sm font-bold text-[#111C2D] uppercase tracking-wide font-label-caps">
+                    Redistribute Worked Leads
+                  </h2>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setRedistributeSubView('allocate')}
+                      className={`py-1.5 px-3 text-xs font-semibold rounded transition ${redistributeSubView === 'allocate' ? 'bg-[#8B5CF6] text-white' : 'bg-[#F8FAFC] border border-[#E2E8F0] text-[#40484B] hover:bg-slate-100'}`}
+                    >
+                      Reassign Leads
+                    </button>
+                    <button
+                      onClick={() => setRedistributeSubView('history')}
+                      className={`py-1.5 px-3 text-xs font-semibold rounded transition ${redistributeSubView === 'history' ? 'bg-[#8B5CF6] text-white' : 'bg-[#F8FAFC] border border-[#E2E8F0] text-[#40484B] hover:bg-slate-100'}`}
+                    >
+                      Reassignment History
+                      {redistributionHistory.length > 0 && (
+                        <span className="ml-1.5 bg-black/10 px-1.5 py-0.5 rounded-full text-[10px]">{redistributionHistory.length}</span>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {redistributeSubView === 'allocate' ? (
+                  <div className="space-y-6">
+                    <div className="max-w-md">
+                      <label className="block text-[11px] text-[#70787C] mb-1 font-body-sm">Source Counselor (whose leads to redistribute)</label>
+                      <select
+                        value={redistributeSourceCounselorId}
+                        onChange={(e) => setRedistributeSourceCounselorId(e.target.value)}
+                        className="w-full text-xs p-2 bg-[#F8FAFC] border border-[#E2E8F0] rounded focus:outline-none focus:border-[#0F4C5C]"
+                      >
+                        <option value="">-- Select Counselor --</option>
+                        {counselors.map(c => (
+                          <option key={c.id} value={c.id}>{c.name} ({c.load} leads)</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {redistributeSourceCounselorId && (
+                      <>
+                        <div>
+                          <label className="block text-[11px] text-[#70787C] mb-2 font-body-sm">
+                            Filter by Counseling Status (optional — leave empty to include all)
+                          </label>
+                          <div className="flex flex-wrap gap-1.5">
+                            {COUNSELING_STATUSES.map(s => (
+                              <button
+                                key={s}
+                                onClick={() => toggleRedistributeStatusFilter(s)}
+                                className={`px-2 py-1 rounded text-[10px] font-semibold border transition ${
+                                  redistributeStatusFilters.includes(s)
+                                    ? 'bg-[#0F4C5C] text-white border-[#0F4C5C]'
+                                    : 'bg-white text-[#40484B] border-[#E2E8F0] hover:bg-slate-50'
+                                }`}
+                              >
+                                {s}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {redistributePoolLoading ? (
+                          <div className="p-6 text-center text-xs text-[#70787C] italic">Loading counselor's leads...</div>
+                        ) : redistributeMatchedCount === 0 ? (
+                          <div className="p-6 text-center border border-[#E2E8F0] rounded bg-[#F8FAFC]">
+                            <span className="material-symbols-outlined text-4xl text-[#70787C] mb-2">filter_none</span>
+                            <p className="text-xs font-semibold text-[#111C2D]">No active leads match this counselor/filter.</p>
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+                            <div className="lg:col-span-3 space-y-6">
+                              <div className="border border-[#E2E8F0] rounded overflow-hidden">
+                                <table className="w-full text-left border-collapse">
+                                  <thead>
+                                    <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps">
+                                      <th className="p-3">Target Counselor</th>
+                                      <th className="p-3 text-center">Current Active Load</th>
+                                      <th className="p-3 text-right">Assign Lead Count</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-[#E2E8F0] text-xs font-body-sm text-[#111C2D]">
+                                    {redistributeTargetCounselors.map(c => (
+                                      <tr key={c.id} className="hover:bg-[#F8FAFC]">
+                                        <td className="p-3 font-semibold">{c.name}</td>
+                                        <td className="p-3 text-center font-data-mono">{c.load} leads</td>
+                                        <td className="p-3 text-right">
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            max={redistributeRemaining + (redistributeAllocations[c.id] || 0)}
+                                            value={redistributeAllocations[c.id] || 0}
+                                            onChange={(e) => handleRedistributeAllocChange(c.id, e.target.value)}
+                                            className="w-24 text-right text-xs p-1 bg-[#F8FAFC] border border-[#E2E8F0] rounded font-data-mono focus:ring-1 focus:ring-[#0F4C5C]"
+                                          />
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              <div className="grid grid-cols-3 gap-4 bg-[#F8FAFC] border border-[#E2E8F0] p-4 rounded">
+                                <div className="text-center">
+                                  <div className="text-xs text-[#70787C] uppercase font-label-caps">Matched Pool</div>
+                                  <div className="text-xl font-bold mt-1 font-data-mono text-[#111C2D]">{redistributeMatchedCount}</div>
+                                </div>
+                                <div className="text-center border-x border-[#E2E8F0]">
+                                  <div className="text-xs text-[#70787C] uppercase font-label-caps">Allocated</div>
+                                  <div className="text-xl font-bold mt-1 font-data-mono text-[#8B5CF6]">{redistributeTotalAllocated}</div>
+                                </div>
+                                <div className="text-center">
+                                  <div className="text-xs text-[#70787C] uppercase font-label-caps">Remaining</div>
+                                  <div className={`text-xl font-bold mt-1 font-data-mono ${redistributeRemaining < 0 ? 'text-[#BA1A1A]' : 'text-[#70787C]'}`}>
+                                    {redistributeRemaining}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="flex justify-end gap-3 border-t border-[#E2E8F0] pt-4">
+                                <button
+                                  onClick={() => setRedistributeAllocations({})}
+                                  className="py-1.5 px-3 border border-[#E2E8F0] text-xs font-semibold rounded hover:bg-[#F8FAFC]"
+                                >
+                                  Reset Counts
+                                </button>
+                                <button
+                                  onClick={handleRedistribute}
+                                  disabled={redistributeTotalAllocated <= 0 || redistributeRemaining < 0}
+                                  className="py-1.5 px-4 bg-[#8B5CF6] hover:bg-[#7C3AED] text-white text-xs font-semibold rounded disabled:opacity-50 transition"
+                                >
+                                  Redistribute Leads
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="lg:col-span-2 space-y-4">
+                              <div className="bg-[#F5F3FF] border border-[#DDD6FE] p-4 rounded-xl shadow-sm text-xs space-y-2">
+                                <h4 className="text-xs font-bold text-[#5B21B6] uppercase tracking-wider font-label-caps flex items-center gap-1">
+                                  <span className="material-symbols-outlined text-sm text-[#7C3AED]">info</span>
+                                  How Redistribution Works
+                                </h4>
+                                <ul className="list-disc pl-4 space-y-1 text-[#5B21B6] text-[11px] leading-snug">
+                                  <li>Only leads currently owned by the source counselor and not yet closed are eligible.</li>
+                                  <li>Counseling status, remarks, registration and fee progress carry over unchanged — only the owner changes.</li>
+                                  <li>Applies immediately — no Team Leader approval needed, same as manual distribution.</li>
+                                  <li>Every move is logged and visible in Reassignment History.</li>
+                                </ul>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-1.5 bg-white border border-[#CBD5E1] px-2.5 py-1.5 rounded-lg w-fit">
+                      <span className="material-symbols-outlined text-[#70787C] text-sm">search</span>
+                      <input
+                        type="text"
+                        placeholder="Search name, phone, email..."
+                        value={redistributionHistorySearch}
+                        onChange={(e) => setRedistributionHistorySearch(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && fetchRedistributionHistory()}
+                        className="text-xs focus:outline-none w-56 font-body-sm bg-white"
+                      />
+                      <button
+                        onClick={fetchRedistributionHistory}
+                        className="text-[10px] font-bold text-[#8B5CF6] uppercase"
+                      >
+                        Search
+                      </button>
+                    </div>
+
+                    <div className="border border-[#E2E8F0] rounded overflow-hidden">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps">
+                            <th className="p-3">Candidate</th>
+                            <th className="p-3">Current Owner</th>
+                            <th className="p-3">Current Status</th>
+                            <th className="p-3 text-center">Hops</th>
+                            <th className="p-3">Last Moved</th>
+                            <th className="p-3"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#E2E8F0] text-xs font-body-sm text-[#111C2D]">
+                          {redistributionHistoryLoading ? (
+                            <tr><td colSpan="6" className="p-8 text-center text-[#70787C] italic">Loading reassignment history...</td></tr>
+                          ) : redistributionHistory.length === 0 ? (
+                            <tr><td colSpan="6" className="p-8 text-center text-[#70787C] italic">No leads have been redistributed yet.</td></tr>
+                          ) : (
+                            redistributionHistory.map(lead => (
+                              <React.Fragment key={lead.id}>
+                                <tr
+                                  onClick={() => setExpandedPathLeadId(expandedPathLeadId === lead.id ? null : lead.id)}
+                                  className="hover:bg-[#F1F5F9] cursor-pointer transition"
+                                >
+                                  <td className="p-3 font-semibold text-[#0F4C5C]">{lead.name}</td>
+                                  <td className="p-3">{lead.current_counselor_name || <span className="text-slate-400 italic">Unassigned</span>}</td>
+                                  <td className="p-3">
+                                    {lead.final_status ? (
+                                      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase bg-slate-100 text-slate-700 border border-slate-200">
+                                        {lead.final_status}
+                                      </span>
+                                    ) : lead.counseling_status ? (
+                                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${getStatusStyle(lead.counseling_status).badge}`}>
+                                        {lead.counseling_status}
+                                      </span>
+                                    ) : (
+                                      <span className="text-xs text-slate-400 italic">—</span>
+                                    )}
+                                  </td>
+                                  <td className="p-3 text-center font-data-mono">{lead.hopCount}</td>
+                                  <td className="p-3 text-[#70787C]">{lead.lastMovedAt ? new Date(lead.lastMovedAt).toLocaleString() : '—'}</td>
+                                  <td className="p-3 text-right text-[#8B5CF6]">
+                                    <span className="material-symbols-outlined text-sm">
+                                      {expandedPathLeadId === lead.id ? 'expand_less' : 'expand_more'}
+                                    </span>
+                                  </td>
+                                </tr>
+                                {expandedPathLeadId === lead.id && (
+                                  <tr>
+                                    <td colSpan="6" className="p-4 bg-[#F8FAFC]">
+                                      <div className="text-[10px] font-bold text-[#70787C] uppercase tracking-wider font-label-caps mb-2">Ownership Pathway</div>
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        {lead.path.map((hop, idx) => (
+                                          <React.Fragment key={idx}>
+                                            <div className="bg-white border border-[#E2E8F0] rounded px-2.5 py-1.5 text-[11px]">
+                                              <div className="font-semibold text-[#111C2D]">{hop.counselorName}</div>
+                                              <div className="text-[#70787C] font-data-mono text-[10px]">{new Date(hop.timestamp).toLocaleString()}</div>
+                                            </div>
+                                            {idx < lead.path.length - 1 && (
+                                              <span className="material-symbols-outlined text-sm text-[#8B5CF6]">arrow_forward</span>
+                                            )}
+                                          </React.Fragment>
+                                        ))}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                )}
+                              </React.Fragment>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
                 )}

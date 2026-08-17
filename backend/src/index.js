@@ -1656,6 +1656,238 @@ app.post('/api/leads/distribute', authenticateToken, requireRole(['super_admin',
 });
 
 
+// --- LEAD REDISTRIBUTION (already-worked leads, counselor -> counselor(s)) ---
+//
+// Distinct from /api/leads/distribute (which only pulls from the unassigned pool) and from
+// the counselor-initiated /api/transfers/* single-lead request/approval flow. This is a
+// direct manager/team-leader/super-admin action — no approval queue — for bulk-moving leads
+// that are ALREADY assigned to and being worked by one counselor onto one or more other
+// counselors, e.g. rebalancing load or handing off a counselor's book. Ownership changes with
+// the same delete-old/insert-new pattern used everywhere else in this codebase (see
+// /api/transfers/resolve/:id), and every field describing real progress on the lead
+// (counseling_status, remark, registration/fee state) is carried forward unchanged — a
+// redistribution changes WHO owns the lead, not what has already happened with it.
+// Forward/escalation flags are deliberately NOT carried forward (reset to their column
+// defaults on the new row) since an escalation-to-manager context tied to the old owner
+// shouldn't follow the lead to a new owner untouched.
+app.post('/api/leads/redistribute', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
+  const { sourceCounselorId, counselingStatuses, allocations } = req.body;
+
+  if (!sourceCounselorId) {
+    return res.status(400).json({ error: 'A source counselor is required.' });
+  }
+  if (!allocations || !Array.isArray(allocations) || allocations.length === 0) {
+    return res.status(400).json({ error: 'Allocations list is required' });
+  }
+  if (allocations.some(a => a.counselorId === sourceCounselorId)) {
+    return res.status(400).json({ error: 'Cannot redistribute leads back to the same source counselor.' });
+  }
+
+  const totalRequested = allocations.reduce((sum, item) => sum + parseInt(item.count || 0, 10), 0);
+  if (totalRequested <= 0) {
+    return res.status(400).json({ error: 'Total requested allocation count must be greater than zero' });
+  }
+
+  try {
+    const sourceCounselor = await db('users').where({ id: sourceCounselorId, role: 'counselor' }).first();
+    if (!sourceCounselor) {
+      return res.status(404).json({ error: 'Source counselor not found.' });
+    }
+
+    // Team Leaders may only move leads between counselors within their own team — checked
+    // up front (outside the transaction) same as the /api/transfers/resolve/:id team check.
+    if (req.user.role === 'team_leader') {
+      if (!req.user.team_id || sourceCounselor.team_id !== req.user.team_id) {
+        return res.status(403).json({ error: 'Access denied: Source counselor is not on your team.' });
+      }
+    }
+
+    let redistributedCount = 0;
+
+    await db.transaction(async (trx) => {
+      let query = trx('lead_assignments')
+        .where({ counselor_id: sourceCounselorId })
+        .forUpdate();
+
+      if (counselingStatuses && Array.isArray(counselingStatuses) && counselingStatuses.length > 0) {
+        query = query.whereIn('counseling_status', counselingStatuses);
+      }
+
+      const matchedAssignments = await query.orderBy('assigned_at', 'asc');
+
+      if (matchedAssignments.length < totalRequested) {
+        throw new Error(`Insufficient leads for this counselor/filter. Requested: ${totalRequested}, Available: ${matchedAssignments.length}`);
+      }
+
+      let ptr = 0;
+      for (const alloc of allocations) {
+        const count = parseInt(alloc.count, 10);
+        if (count <= 0) continue;
+
+        const targetCounselor = await trx('users').where({ id: alloc.counselorId, role: 'counselor', active: true }).first();
+        if (!targetCounselor) {
+          throw new Error(`Counselor ${alloc.counselorId} is not active or invalid.`);
+        }
+        if (req.user.role === 'team_leader' && targetCounselor.team_id !== req.user.team_id) {
+          throw new Error(`Counselor ${targetCounselor.name} is not on your team.`);
+        }
+
+        const batch = matchedAssignments.slice(ptr, ptr + count);
+        ptr += count;
+
+        for (const assignment of batch) {
+          await trx('lead_assignments').where({ id: assignment.id }).delete();
+
+          await trx('lead_assignments').insert({
+            id: randomUUID(),
+            lead_id: assignment.lead_id,
+            counselor_id: targetCounselor.id,
+            assigned_by: req.user.id,
+            assigned_at: new Date(),
+            stage: assignment.stage,
+            disposition: assignment.disposition,
+            counseling_status: assignment.counseling_status,
+            not_contactable_reason: assignment.not_contactable_reason,
+            status_remark: assignment.status_remark,
+            registration_status: assignment.registration_status,
+            registration_date: assignment.registration_date,
+            fee_payment_status: assignment.fee_payment_status,
+            fee_amount_paid: assignment.fee_amount_paid,
+            fee_total_amount: assignment.fee_total_amount,
+            fee_reminder_due_at: assignment.fee_reminder_due_at,
+            fee_reminder_note: assignment.fee_reminder_note,
+            fee_reminder_acknowledged: assignment.fee_reminder_acknowledged || false,
+            locked: true,
+            updated_at: new Date()
+          });
+
+          // Carry any still-open follow-up over to the new owner — same reasoning as the
+          // single-lead transfer-approve flow (see /api/transfers/resolve/:id).
+          await trx('follow_ups')
+            .where({ lead_id: assignment.lead_id, counselor_id: sourceCounselorId, completed: false })
+            .update({ counselor_id: targetCounselor.id });
+
+          await logActivity(trx, assignment.lead_id, targetCounselor.id, 'redistributed',
+            `Lead redistributed from ${sourceCounselor.name} to ${targetCounselor.name} by ${req.user.name} (bulk redistribution)`);
+
+          redistributedCount += 1;
+        }
+      }
+    });
+
+    res.json({ message: `Successfully redistributed ${redistributedCount} lead(s) from ${sourceCounselor.name}.` });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message || 'Lead redistribution failed' });
+  }
+});
+
+// GET /api/leads/redistribution-history — per-lead ownership pathway for every lead that has
+// been through at least one bulk redistribution, so a manager can see the "before -> after"
+// trail (which counselor(s) owned it, when, in what order) rather than just its current owner.
+app.get('/api/leads/redistribution-history', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
+  const { search, counselor_id } = req.query;
+
+  try {
+    const redistributedLeadIds = await db('lead_activity_log')
+      .where({ action: 'redistributed' })
+      .distinct('lead_id')
+      .pluck('lead_id');
+
+    if (redistributedLeadIds.length === 0) {
+      return res.json([]);
+    }
+
+    // Current owner/status, same join shape as GET /api/leads/master, scoped to just the
+    // leads that have been redistributed at least once.
+    let query = db('leads')
+      .leftJoin('lead_assignments', 'leads.id', 'lead_assignments.lead_id')
+      .leftJoin('users as counselors', 'lead_assignments.counselor_id', 'counselors.id')
+      .leftJoin('closures', 'leads.id', 'closures.lead_id')
+      .leftJoin('users as closure_counselors', 'closures.counselor_id', 'closure_counselors.id')
+      .whereIn('leads.id', redistributedLeadIds);
+
+    if (req.user.role === 'team_leader') {
+      if (!req.user.team_id) {
+        return res.json([]);
+      }
+      const teamCounselorIds = db('users').where({ team_id: req.user.team_id, role: 'counselor' }).select('id');
+      query = query.where(function () {
+        this.whereIn('lead_assignments.counselor_id', teamCounselorIds)
+          .orWhereIn('closures.counselor_id', teamCounselorIds);
+      });
+    }
+
+    const leads = await query.select(
+      'leads.id', 'leads.name', 'leads.phone', 'leads.email', 'leads.city', 'leads.state', 'leads.source',
+      'lead_assignments.counseling_status',
+      db.raw('COALESCE(lead_assignments.counselor_id, closures.counselor_id) as current_counselor_id'),
+      db.raw('COALESCE(counselors.name, closure_counselors.name) as current_counselor_name'),
+      db.raw('CASE WHEN closures.id IS NOT NULL THEN closures.final_status ELSE NULL END as final_status')
+    );
+
+    if (leads.length === 0) {
+      return res.json([]);
+    }
+
+    const finalLeadIds = leads.map(l => l.id);
+
+    // Full ownership trail — every action that ever moved or set an owner, in order.
+    const pathLogs = await db('lead_activity_log')
+      .join('users', 'lead_activity_log.counselor_id', 'users.id')
+      .whereIn('lead_activity_log.lead_id', finalLeadIds)
+      .whereIn('lead_activity_log.action', ['distributed', 'redistributed', 'transfer_approve'])
+      .orderBy('lead_activity_log.timestamp', 'asc')
+      .select('lead_activity_log.lead_id', 'lead_activity_log.action', 'lead_activity_log.remark',
+        'lead_activity_log.timestamp', 'users.name as counselor_name', 'users.id as counselor_id');
+
+    const pathByLead = {};
+    pathLogs.forEach(log => {
+      if (!pathByLead[log.lead_id]) pathByLead[log.lead_id] = [];
+      pathByLead[log.lead_id].push({
+        action: log.action,
+        counselorName: log.counselor_name,
+        counselorId: log.counselor_id,
+        remark: log.remark,
+        timestamp: log.timestamp
+      });
+    });
+
+    let result = leads.map(lead => {
+      const path = pathByLead[lead.id] || [];
+      return {
+        ...lead,
+        path,
+        hopCount: path.length,
+        lastMovedAt: path.length > 0 ? path[path.length - 1].timestamp : null
+      };
+    });
+
+    if (search) {
+      const s = search.toLowerCase();
+      result = result.filter(l =>
+        (l.name || '').toLowerCase().includes(s) ||
+        (l.phone || '').includes(s) ||
+        (l.email || '').toLowerCase().includes(s)
+      );
+    }
+
+    if (counselor_id) {
+      result = result.filter(l =>
+        l.current_counselor_id === counselor_id || l.path.some(p => p.counselorId === counselor_id)
+      );
+    }
+
+    result.sort((a, b) => new Date(b.lastMovedAt || 0) - new Date(a.lastMovedAt || 0));
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch redistribution history' });
+  }
+});
+
+
 // --- COUNSELOR DASHBOARD ---
 
 // Get counselor leads
@@ -2694,7 +2926,7 @@ app.post('/api/transfers/resolve/:id', authenticateToken, requireRole(['manager'
 // --- MASTER LEAD REPOSITORY ---
 
 app.get('/api/leads/master', authenticateToken, requireRole(['super_admin', 'manager', 'team_leader']), async (req, res) => {
-  const { batch_id, counselingStatus, status, source } = req.query;
+  const { batch_id, counselingStatus, status, source, counselor_id } = req.query;
 
   try {
     // Counselor name falls back to closures.counselor_id — dropping a lead deletes its
@@ -2734,6 +2966,10 @@ app.get('/api/leads/master', authenticateToken, requireRole(['super_admin', 'man
       'lead_assignments.fee_total_amount',
       'lead_assignments.fee_reminder_due_at',
       'lead_assignments.locked',
+      // 'Owner Counselor' needs this to filter/attribute by id, not just render the name —
+      // falls back to closures.counselor_id for the same reason counselor_name does (a
+      // dropped/closed lead has no lead_assignments row left).
+      db.raw('COALESCE(lead_assignments.counselor_id, closures.counselor_id) as counselor_id'),
       db.raw('COALESCE(counselors.name, closure_counselors.name) as counselor_name'),
       'universities.name as university_name'
     );
@@ -2752,6 +2988,13 @@ app.get('/api/leads/master', authenticateToken, requireRole(['super_admin', 'man
 
     if (source) {
       query = query.where({ 'leads.source': source });
+    }
+
+    if (counselor_id) {
+      query = query.where(function () {
+        this.where('lead_assignments.counselor_id', counselor_id)
+          .orWhere('closures.counselor_id', counselor_id);
+      });
     }
 
     const leads = await query.orderBy('leads.created_at', 'desc');
