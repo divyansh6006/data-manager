@@ -17,7 +17,7 @@
  * ============================================================================
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend, AreaChart, Area
@@ -186,6 +186,10 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   const [timelineLeads, setTimelineLeads] = useState([]);
   const [timelineSearchQuery, setTimelineSearchQuery] = useState('');
   const [timelineLoading, setTimelineLoading] = useState(false);
+  // Stale-response guard for fetchTimelineLeads — a fetch fires on every keystroke with no
+  // cancellation, so a slow response for an earlier (broader) query could resolve after a
+  // faster one for the current (narrower) query and silently overwrite it with stale results.
+  const timelineLeadsRequestId = useRef(0);
 
   // Dropped Leads States
   const [managerDroppedLeads, setManagerDroppedLeads] = useState([]);
@@ -592,16 +596,22 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
   };
 
   const fetchTimelineLeads = async (searchVal = '') => {
+    const requestId = ++timelineLeadsRequestId.current;
     try {
       const searchParam = searchVal ? `&search=${encodeURIComponent(searchVal)}` : '';
       const response = await fetch(`/api/reports/custom-timeline/leads?start_date=${timelineStartDate}&end_date=${timelineEndDate}${searchParam}`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await response.json();
+      // Discard if a newer keystroke's request has already started — otherwise a slow
+      // response for an earlier, broader search term can land after a faster one for the
+      // current term and silently overwrite it with stale results.
+      if (requestId !== timelineLeadsRequestId.current) return;
       if (response.ok) {
         setTimelineLeads(data);
       }
     } catch (err) {
+      if (requestId !== timelineLeadsRequestId.current) return;
       console.error('Failed to fetch timeline leads list', err);
     }
   };
@@ -2671,9 +2681,14 @@ export default function ManagerDashboard({ token, user, onLogout, onBackToAdmin 
                   <button
                     onClick={() => {
                       setPoolLeads([]);
+                      // filters' real keys are city/state (declared above) — this used to
+                      // reset a dead `location` key instead, so a city/state filter left over
+                      // from an earlier session silently survived this "see everything"
+                      // banner action, showing far fewer leads than promised.
                       setFilters(prev => ({
                         ...prev,
-                        location: '',
+                        city: '',
+                        state: '',
                         source: '',
                         interest: '',
                         min_exp: '',
